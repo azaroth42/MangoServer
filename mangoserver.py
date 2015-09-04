@@ -6,10 +6,12 @@
 
 import json
 from functools import partial
+import uuid
+import datetime
+
+from bottle import Bottle, route, run, request, response, abort, error
+
 from bson import ObjectId
-
-from rdflib import Graph
-
 try:
     # 3.x
     from pymongo import MongoClient
@@ -17,10 +19,31 @@ except:
     # 2.x
     from pymongo import Connection as MongoClient
 
-from bottle import Bottle, route, run, request, response, abort, error
+from rdflib import Graph
+from pyld import jsonld
 
-import uuid
-import datetime
+# Stop code from looking up the contexts online EVERY TIME
+def load_document_local(url):
+    doc = {
+        'contextUrl': None,
+        'documentUrl': None,
+        'document': ''
+    }
+    if url == "http://iiif.io/api/presentation/2/context.json":
+        fn = "contexts/context_20.json"
+    elif url in ["http://www.w3.org/ns/oa.jsonld","http://www.w3.org/ns/oa-context-20130208.json"]:
+        fn = "contexts/context_oa.json"
+    elif url in ['http://www.w3.org/ns/anno.jsonld']:
+        fn = "contexts/context_wawg.json"
+    fh = file(fn)
+    data = fh.read()
+    fh.close()
+    doc['document'] = data;
+    return doc
+
+jsonld.set_document_loader(load_document_local)
+
+
 
 class MongoEncoder(json.JSONEncoder):
     def default(self, obj):
@@ -72,7 +95,7 @@ class MangoServer(object):
             self.connection = self._connect(self.mongo_db, self.mongo_host, self.mongo_port)
 
         container = self.connection[container]
-        # monkey patch 2.x API up to 3.x API
+        # monkey patch PyMongo 2.x API up to 3.x API
         if not hasattr(container, 'insert_one'):
             container.insert_one = container.insert
         if not hasattr(container, 'replace_one'):
@@ -82,11 +105,22 @@ class MangoServer(object):
     def _make_uri(self, container, resource=""):
         return "%s/%s%s/%s" % (self.url_host, self.url_prefix, container, resource)
 
+    def _slug_ok(self, value):
+        if len(value) > 128: return False
+        if value.find('/') > -1: return False
+        if value.find('#') > -1: return False
+        if value.find('%') > -1: return False
+        if value.find('?') > -1: return False
+        value = value.replace(' ', '+')
+        value = value.replace('[', '')
+        value = value.replace(']', '')
+        return value
+
     def _make_id(self, container, resource=""):
         if not resource:
-            # Create new id
+            # Create new id, maybe using slug
             resource = str(uuid.uuid4())
-            slug = request.headers.get('slug', '')
+            slug = self._slug_ok(request.headers.get('slug', ''))
             if slug:
                 # make sure it doesn't already exist
                 coll = self._collection(container)
@@ -238,13 +272,13 @@ class MangoServer(object):
             response.status = 200
 
         uri = self._make_uri(container)
-        return self._jsonify(js, uri)        
+        return self._conneg(js, uri)        
 
     def delete_container(self, container):
         coll = self._collection(container)
         coll.drop()
         response.status = 204
-        return {}
+        return ""
 
     def get_resource(self, container, resource):
         coll = self._collection(container)
@@ -264,7 +298,7 @@ class MangoServer(object):
         js["_id"] = myid
         inserted = coll.insert_one(js)
         response.status = 201
-        return self._jsonify(js, uri)
+        return self._conneg(js, uri)
 
     def put_resource(self, container, resource):
         coll = self._collection(rtype)
@@ -272,7 +306,7 @@ class MangoServer(object):
         coll.replace_one({"_id": self._make_id(container, resource)}, js)
         response.status = 202
         uri = self._make_uri(container, resource)
-        return self._jsonify(js, uri)
+        return self._conneg(js, uri)
 
     def post_resource(self, container, resource):
         abort(400, "Cannot POST to an individual resource, use PUT or POST to a container")
@@ -291,7 +325,7 @@ class MangoServer(object):
         coll = self._collection(container)
         coll.remove({"_id": self._make_id(container, resource)})
         response.status = 204
-        return {}
+        return ""
 
     def dispatch_views(self):
         methods = ["get", "post", "put", "patch", "delete", "options"]
@@ -302,12 +336,12 @@ class MangoServer(object):
                 [m], getattr(self, "%s_resource" % m, self.not_implemented))
 
     def before_request(self):
+        # Process incoming application/ld+json as application/json
         self._handle_ld_json()
 
 
     def after_request(self):
-        """A bottle hook for json responses."""
-
+        # Add CORS and other static headers
         methods = 'PUT, PATCH, GET, POST, DELETE, OPTIONS'
         headers = 'Origin, Accept, Content-Type, X-Requested-With'
         response.headers['Access-Control-Allow-Origin'] = '*'
@@ -328,12 +362,11 @@ class MangoServer(object):
 
 
     def error(self, error, message=None):
-        """Returns the error response."""
+        # Make a little error message in JSON-LD
         return self._jsonify({"error": error.status_code,
                         "message": error.body or message}, "")
 
     def get_error_handler(self):
-        """Customized errors"""
         return {
             500: partial(self.error, message="Internal Server Error."),
             404: partial(self.error, message="Document Not Found."),
@@ -344,13 +377,13 @@ class MangoServer(object):
         }
 
     def get_bottle_app(self):
-        """Returns bottle instance"""
         self.app = Bottle()
         self.dispatch_views()
         self.app.hook('before_request')(self.before_request)
         self.app.hook('after_request')(self.after_request)
         self.app.error_handler = self.get_error_handler()
         return self.app
+
 
 def main():
     from optparse import OptionParser
@@ -380,7 +413,6 @@ def main():
     host, port = (options.address or 'localhost'), 8000
     if ':' in host:
         host, port = host.rsplit(':', 1)
-
 
     # make booleans
     debug = options.debug in ['True', True, 1]
