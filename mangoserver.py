@@ -1,15 +1,21 @@
 
 # Design Notes
 # All URLs that end in a / are containers
-# All containers are Mongo collections
-# All resources are in the appropriate container
-# Container _id is from prefix to / (not included)
-# Resource _id is just the trailing segment
+# All containers are Mongo collections, regardless of where they appear in the tree
+# All resources are in the appropriate collection
 
 import json
 from functools import partial
 from bson import ObjectId
-from pymongo import Connection
+
+from rdflib import Graph
+
+try:
+    # 3.x
+    from pymongo import MongoClient
+except:
+    # 2.x
+    from pymongo import Connection as MongoClient
 
 from bottle import Bottle, route, run, request, response, abort, error
 
@@ -25,11 +31,11 @@ class MongoEncoder(json.JSONEncoder):
         return super(MongoEncoder, self).default(obj)
 
 
-class LdpServer(object):
+class MangoServer(object):
 
-    def __init__(self, database="ldp", host='localhost', port=27017,
+    def __init__(self, database="mango", host='localhost', port=27017,
                  sort_keys=True, compact_json=False, indent_json=2,
-                 url_host="http://localhost:8000/", url_prefix=""):
+                 url_host="http://localhost:8000/", url_prefix="", json_ld=True):
 
         # Mongo Connection
         self.mongo_host = host
@@ -41,32 +47,37 @@ class LdpServer(object):
         self.sort_keys = sort_keys
         self.compact_json = compact_json
         self.indent_json = indent_json
+        self.json_content_type = "application/ld+json" if json_ld else "application/json"
 
         self.url_host = url_host
         self.url_prefix = url_prefix
 
         self._container_desc_id = "__container_metadata__"
 
+        self.rdflib_format_map = {
+              'application/rdf+xml' : 'pretty-xml',
+              'text/rdf+xml' : 'pretty-xml',
+              'text/turtle' : 'turtle',
+              'application/turtle' : 'turtle',
+              'application/x-turtle' : 'turtle',
+              'text/plain' : 'nt',
+              'text/rdf+n3' : 'n3'}
 
-    def _jsonify(self, what, uri):
-        what['@id'] = uri
-        try:
-            del what['_id']
-        except:
-            pass            
-        if self.compact_json:
-            me = MongoEncoder(sort_keys=self.sort_keys, separators=(',',':'))
-        else:
-            me = MongoEncoder(sort_keys=self.sort_keys, indent=self.indent_json)
-        return me.encode(what)
 
     def _connect(self, database, host=None, port=None):
-        return Connection(host=host, port=port)[database]
+        return MongoClient(host=host, port=port)[database]
 
     def _collection(self, container):
         if not self.connection:
             self.connection = self._connect(self.mongo_db, self.mongo_host, self.mongo_port)
-        return self.connection[container]
+
+        container = self.connection[container]
+        # monkey patch 2.x API up to 3.x API
+        if not hasattr(container, 'insert_one'):
+            container.insert_one = container.insert
+        if not hasattr(container, 'replace_one'):
+            container.replace_one = container.update
+        return container
 
     def _make_uri(self, container, resource=""):
         return "%s/%s%s/%s" % (self.url_host, self.url_prefix, container, resource)
@@ -98,6 +109,7 @@ class LdpServer(object):
                 request.json = json.loads(b)
 
     def _fix_json(self, js={}):
+        # Validate / Patch JSON
         if not js:
             try:    
                 js = request.json
@@ -109,17 +121,77 @@ class LdpServer(object):
             del js['@id']
         return js
 
+    def _jsonify(self, what, uri):
+        what['@id'] = uri
+        try:
+            del what['_id']
+        except:
+            pass            
+        if self.compact_json:
+            me = MongoEncoder(sort_keys=self.sort_keys, separators=(',',':'))
+        else:
+            me = MongoEncoder(sort_keys=self.sort_keys, indent=self.indent_json)
+        return me.encode(what)
+
+    def _conneg(self, data, uri):
+        # Content Negotiate with client
+
+        out = self._jsonify(data, uri)
+        accept = request.headers.get('Accept', '')
+
+        if not accept:
+            ct = self.json_content_type
+        else:
+
+            prefs = []
+            for media_range in accept.split(","):
+                parts = media_range.split(";")
+                media_type = parts.pop(0).strip()
+                media_params = []
+                typ, subtyp = media_type.split('/')
+                q = 1.0
+                for part in parts:
+                    (key, value) = part.lstrip().split("=", 1)
+                    key = key.strip()
+                    value = value.strip()
+                    if key == "q":
+                        q = float(value)
+                    else:
+                        media_params.append((key, value))
+                prefs.append((media_type, dict(media_params), q))
+            prefs.sort(lambda x, y: -cmp(x[2], y[2]))
+
+            ct = self.json_content_type
+            format = ""
+            for p in prefs:
+                if self.rdflib_format_map.has_key(p[0]):
+                    ct = p[0]
+                    format = self.rdflib_format_map[p[0]]
+                    break
+                elif p[0] in ['application/json', 'application/ld+json']:
+                    ct = p[0]
+                    break
+
+            if format:
+                g = Graph()
+                g.parse(data=out, format='json-ld')
+                out = g.serialize(format=format)
+
+        response['content_type'] = ct
+        return out
+
+
     def get_container(self, container):
         coll = self._collection(container)
         metadata = coll.find_one({"_id": self._container_desc_id})
         if metadata == None:
-            abort(404)
+            abort(404, "Unknown container")
 
         # Implement LDP Paging here
         limit = 1000
         offset = 0
 
-        cursor = coll.find({}, {'_id':1})
+        cursor = coll.find({}, {'_id':1, '@type': 1})
 
         if not limit:
             included = []
@@ -146,7 +218,7 @@ class LdpServer(object):
         response.headers['Link'] = '<http://www.w3.org/ns/ldp#BasicContainer>;rel="type",<http://www.w3.org/ns/ldp#Resource>;rel="type"'
 
         uri = self._make_uri(container)
-        return self._jsonify(resp, uri)
+        return self._conneg(resp, uri)
 
     def put_container(self, container):
         # Grab the body and put it into magic __container_metadata__
@@ -157,11 +229,11 @@ class LdpServer(object):
         if metadata == None:
             metadata = js
             metadata["_id"] = self._container_desc_id
-            current = coll.insert(metadata)
+            current = coll.insert_one(metadata)
             response.status = 201
         else:
             metadata.update(js)
-            coll.update({"_id": self._container_desc_id}, js)
+            coll.replace_one({"_id": self._container_desc_id}, js)
             current = metadata
             response.status = 200
 
@@ -181,7 +253,7 @@ class LdpServer(object):
             abort(404)
 
         uri = self._make_uri(container, resource)
-        return self._jsonify(data, uri)
+        return self._conneg(data, uri)
 
     def post_container(self, container):
         coll = self._collection(container)
@@ -190,24 +262,27 @@ class LdpServer(object):
         myid = self._make_id(container)
         uri = self._make_uri(container, myid)
         js["_id"] = myid
-        inserted = coll.insert(js)
+        inserted = coll.insert_one(js)
         response.status = 201
         return self._jsonify(js, uri)
 
     def put_resource(self, container, resource):
         coll = self._collection(rtype)
         js = self._fix_json()
-        coll.update({"_id": self._make_id(container, resource)}, js)
+        coll.replace_one({"_id": self._make_id(container, resource)}, js)
         response.status = 202
         uri = self._make_uri(container, resource)
         return self._jsonify(js, uri)
 
     def post_resource(self, container, resource):
-        abort(400)
+        abort(400, "Cannot POST to an individual resource, use PUT or POST to a container")
 
     def patch_resource(self, container, resource):
         coll = self._collection(container)
-        coll.update({"_id": ObjectId(self._make_id(container, resource))},
+
+        # XXX Need to process some patch format
+
+        coll.update_one({"_id": ObjectId(self._make_id(container, resource))},
                           {"$set": request.json})
         response.status = 202
         return self.get_resource(container, resource)
@@ -233,13 +308,12 @@ class LdpServer(object):
     def after_request(self):
         """A bottle hook for json responses."""
 
-        #response['content_type'] = "application/ld+json"
-        response["content_type"] = "application/json"
         methods = 'PUT, PATCH, GET, POST, DELETE, OPTIONS'
         headers = 'Origin, Accept, Content-Type, X-Requested-With'
         response.headers['Access-Control-Allow-Origin'] = '*'
         response.headers['Access-Control-Allow-Methods'] = methods
         response.headers['Access-Control-Allow-Headers'] = headers
+        response.headers['Vary'] = "Accept, Origin"
 
 
     def not_implemented(self, *args, **kwargs):
@@ -288,7 +362,7 @@ def main():
     parser.add_option("--mongodb-port", dest="mongodb_port",
                       help="MongoDB port", default=27017)
     parser.add_option("-d", "--database", dest="database",
-                      help="MongoDB database name", default="ldp")
+                      help="MongoDB database name", default="mango")
     parser.add_option('-p', '--prefix', dest="url_prefix", 
                       help="URL Prefix in API pattern", default="")
     parser.add_option('-s', '--sort-keys', dest="sort_keys", default=True,
@@ -297,7 +371,7 @@ def main():
                        help="Should json output have compact whitespace?")
     parser.add_option('--indent-json', dest="indent_json", default=2, type=int,
                        help="Number of spaces to indent json output")
-    parser.add_option('--json-ld', dest="json_ld", default=True,
+    parser.add_option('--json-ld', dest="json_ld", default=False,
                        help="Should return json-ld media type instead of json?")
     parser.add_option('--debug', dest="debug", default=True)
 
@@ -307,22 +381,23 @@ def main():
     if ':' in host:
         host, port = host.rsplit(':', 1)
 
+
+    # make booleans
     debug = options.debug in ['True', True, 1]
     sort_keys = options.sort_keys in ['True', True, '1']
     compact_json = options.compact_json in ['True', True, '1']
-    indent = options.indent_json
     jsonld = options.json_ld in ['True', True, '1']
-    url_prefix = options.url_prefix
 
-    mr = LdpServer(
+    mr = MangoServer(
         host=options.mongodb_host,
         port=options.mongodb_port,
         database=options.database,
         sort_keys=sort_keys,
         compact_json=compact_json,
-        indent_json=indent,
+        indent_json=options.indent_json,
         url_host = "http://%s:%s" % (host, port),
-        url_prefix=url_prefix
+        url_prefix=options.url_prefix,
+        json_ld=jsonld
     )
 
     run(host=host, port=port, app=mr.get_bottle_app(), debug=debug)
