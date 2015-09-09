@@ -8,8 +8,9 @@ import json
 from functools import partial
 import uuid
 import datetime
+import hashlib
 
-from bottle import Bottle, route, run, request, response, abort, error
+from bottle import Bottle, route, run, request, response, abort, error, redirect
 
 from bson import ObjectId
 try:
@@ -31,7 +32,7 @@ def load_document_local(url):
     }
     if url == "http://iiif.io/api/presentation/2/context.json":
         fn = "contexts/context_20.json"
-    elif url in ["http://www.w3.org/ns/oa.jsonld","http://www.w3.org/ns/oa-context-20130208.json"]:
+    elif url in ["http://www.w3.org/ns/oa.jsonld", "http://www.w3.org/ns/oa-context-20130208.json"]:
         fn = "contexts/context_oa.json"
     elif url in ['http://www.w3.org/ns/anno.jsonld']:
         fn = "contexts/context_wawg.json"
@@ -76,6 +77,10 @@ class MangoServer(object):
         self.url_prefix = url_prefix
 
         self._container_desc_id = "__container_metadata__"
+        self.json_ld_profile = "http://www.w3.org/TR/annotation-model/jsonLdProfile"
+        self.default_context = "http://www.w3.org/ns/anno.jsonld"
+        self.default_page_size = 1000
+        self.small_page_size = 100
 
         self.rdflib_format_map = {
               'application/rdf+xml' : 'pretty-xml',
@@ -95,11 +100,6 @@ class MangoServer(object):
             self.connection = self._connect(self.mongo_db, self.mongo_host, self.mongo_port)
 
         container = self.connection[container]
-        # monkey patch PyMongo 2.x API up to 3.x API
-        if not hasattr(container, 'insert_one'):
-            container.insert_one = container.insert
-        if not hasattr(container, 'replace_one'):
-            container.replace_one = container.update
         return container
 
     def _make_uri(self, container, resource=""):
@@ -167,35 +167,59 @@ class MangoServer(object):
             me = MongoEncoder(sort_keys=self.sort_keys, indent=self.indent_json)
         return me.encode(what)
 
+    def _parse_accept(self, value):
+        prefs = []
+        for item in value.split(","):
+            parts = item.split(";")
+            main = parts.pop(0).strip()
+            params = []
+            q = 1.0
+            for part in parts:
+                (key, value) = part.lstrip().split("=", 1)
+                key = key.strip()
+                value = value.strip().replace('"', '')
+                if key == "q":
+                    q = float(value)
+                else:
+                    params.append((key, value))
+            prefs.append((main, dict(params), q))
+        prefs.sort(lambda x, y: -cmp(x[2], y[2]))        
+        return prefs
+
+    def _parse_prefer(self, value):
+
+        prefs = []
+        for item in value.split(","):
+            parts = item.split(";")
+            main = parts.pop(0).strip()
+            if "=" in main:
+                # Can have whitespace, so can't use as useful key
+                main = [x.strip().replace('"', '') for x in main.split('=')]
+            else:
+                main = [main, ""]
+            params = []
+            for part in parts:
+                (key, value) = part.lstrip().split("=", 1)
+                key = key.strip()
+                value = value.strip().replace('"', '')
+                params.append((key, value))
+            prefs.append((main, dict(params)))       
+        return prefs
+
     def _conneg(self, data, uri):
         # Content Negotiate with client
 
         out = self._jsonify(data, uri)
+
+        # Construct our ETag from the JSON first
+        h = hashlib.md5()
+        h.update(out)
+        response['ETag'] = h.hexdigest()
+
         accept = request.headers.get('Accept', '')
-
-        if not accept:
-            ct = self.json_content_type
-        else:
-
-            prefs = []
-            for media_range in accept.split(","):
-                parts = media_range.split(";")
-                media_type = parts.pop(0).strip()
-                media_params = []
-                typ, subtyp = media_type.split('/')
-                q = 1.0
-                for part in parts:
-                    (key, value) = part.lstrip().split("=", 1)
-                    key = key.strip()
-                    value = value.strip()
-                    if key == "q":
-                        q = float(value)
-                    else:
-                        media_params.append((key, value))
-                prefs.append((media_type, dict(media_params), q))
-            prefs.sort(lambda x, y: -cmp(x[2], y[2]))
-
-            ct = self.json_content_type
+        ct = self.json_content_type
+        if accept:
+            prefs = self._parse_accept(accept)
             format = ""
             for p in prefs:
                 if self.rdflib_format_map.has_key(p[0]):
@@ -205,7 +229,6 @@ class MangoServer(object):
                 elif p[0] in ['application/json', 'application/ld+json']:
                     ct = p[0]
                     break
-
             if format:
                 g = Graph()
                 g.parse(data=out, format='json-ld')
@@ -221,37 +244,92 @@ class MangoServer(object):
         if metadata == None:
             abort(404, "Unknown container")
 
-        # Implement LDP Paging here
-        limit = 1000
-        offset = 0
+        limit = request.query.get('limit', -1)  # -1 = Use a default
+        offset = request.query.get('offset', -1) # -1 = Not a page
 
-        cursor = coll.find({}, {'_id':1, '@type': 1})
+        # Other params might make it a search?
+
+        uri = self._make_uri(container)
+
+        prefer = request.headers.get('Prefer', '')
+        # http://tools.ietf.org/html/rfc7240
+        if prefer:
+            prefs = self._parse_prefer(prefer)
+            for p in prefs:
+                if p[0] == ['return', 'representation']:
+                    if p[1] == ['omit', 'http://www.w3.org/ns/ldp#PreferContainment']:
+                        # No members
+                        limit = 0
+                        response['Preference-Applied'] = "return=representation"
+                    elif p[1].has_key('max-member-count'):
+                        limit = int(p[1]['max-member-count'])
+                        response['Preference-Applied'] = "return=representation"                        
+                        if limit < 1:
+                            abort(400, "max-member-count must be 1 or higher")
+            if limit > 0:
+                # This doesn't actually conform :(
+                loc = "{0}?limit={1}&offset=0".format(uri, limit)
+                redirect(loc, 303)
+
+        cursor = coll.find({'_id': {'$ne' : self._container_desc_id}}, {'_id':1, '@type': 1})
+        totalItems = cursor.count()
+
+        # Put everything in if count is small
+        if totalItems < limit and totalItems <= self.small_page_size:
+            cursor = coll.find({'_id': {'$ne' : self._container_desc_id}})            
 
         if not limit:
             included = []
         else:
-            objects = list(cursor.skip(offset).limit(limit))
-            included = []
+            if limit < 0:
+                limit = self.default_page_size
+            else:
+                try:
+                    limit = int(limit)
+                except:
+                    abort(400, "Limit must be an integer")
 
+            if offset == -1:
+                off = 0
+            else:
+                try:
+                    off = int(offset)
+                except:
+                    abort(400, "Offset must be an integer")
+
+            objects = list(cursor.skip(off).limit(limit))
+
+            included = []
             for what in objects:
-                mid = what['_id']
-                if mid == self._container_desc_id:
-                    # Don't include metadata as contained resources
-                    continue
+                myid = what['_id']
                 out = self._fix_json(what)
-                out['@id'] = self._make_uri(container, self._unmake_id(mid))           
+                out['@id'] = self._make_uri(container, self._unmake_id(myid))           
                 included.append(out)
 
-        resp = {"@context": "http://www.w3.org/ns/anno.jsonld",
-                "@type": "ldp:BasicContainer",
-                "as:totalItems" : cursor.count()-1,
-                "ldp:contains": included}
-        resp.update(metadata)
+        if offset == -1:
+            # Container
+            resp = {"@context": "http://www.w3.org/ns/anno.jsonld",
+                    "@id": uri,            
+                    "@type": ["OrderedCollection", "BasicContainer"],
+                    "totalItems" : totalItems,
+                    "contains": included}      
+            resp.update(metadata)
+
+            links = ['<http://www.w3.org/ns/ldp#BasicContainer>;rel="type"', 
+                '<http://www.w3.org/TR/annotation-protocol/constraints>; rel="http://www.w3.org/ns/ldp#constrainedBy"']
+        else:
+            # Page
+            resp = {"@context": "http://www.w3.org/ns/anno.jsonld",
+                    "@id": "{0}?limit={1}&offset={2}".format(uri, limit, off),
+                    "@type": "OrderedCollectionPage",
+                    "totalItems" : totalItems,
+                    "orderedItems": included}
+            links = []
 
         # Add required headers
-        response.headers['Link'] = '<http://www.w3.org/ns/ldp#BasicContainer>;rel="type",<http://www.w3.org/ns/ldp#Resource>;rel="type"'
+        response['Link'] = ', '.join(links)
+        response['Allow'] = 'GET,POST,PUT,DELETE,OPTIONS,HEAD'
 
-        uri = self._make_uri(container)
         return self._conneg(resp, uri)
 
     def put_container(self, container):
@@ -263,6 +341,7 @@ class MangoServer(object):
         if metadata == None:
             metadata = js
             metadata["_id"] = self._container_desc_id
+            del metadata['@id']
             current = coll.insert_one(metadata)
             response.status = 201
         else:
@@ -287,6 +366,10 @@ class MangoServer(object):
             abort(404)
 
         uri = self._make_uri(container, resource)
+
+        # Add static headers
+        response.headers['Link'] = '<{0}>;rel="self", <http://www.w3.org/ns/ldp#Resource>;rel="type"'.format(uri)
+
         return self._conneg(data, uri)
 
     def post_container(self, container):
@@ -347,7 +430,7 @@ class MangoServer(object):
         response.headers['Access-Control-Allow-Origin'] = '*'
         response.headers['Access-Control-Allow-Methods'] = methods
         response.headers['Access-Control-Allow-Headers'] = headers
-        response.headers['Vary'] = "Accept, Origin"
+        response.headers['Vary'] = "Accept"
 
 
     def not_implemented(self, *args, **kwargs):
