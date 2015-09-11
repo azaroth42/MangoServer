@@ -12,13 +12,9 @@ import hashlib
 
 from bottle import Bottle, route, run, request, response, abort, error, redirect
 
+# Requires pymongo 3.x
 from bson import ObjectId
-try:
-    # 3.x
-    from pymongo import MongoClient
-except:
-    # 2.x
-    from pymongo import Connection as MongoClient
+from pymongo import MongoClient
 
 from rdflib import Graph
 from pyld import jsonld
@@ -45,7 +41,6 @@ def load_document_local(url):
 jsonld.set_document_loader(load_document_local)
 
 
-
 class MongoEncoder(json.JSONEncoder):
     def default(self, obj):
         if isinstance(obj, ObjectId):
@@ -53,7 +48,6 @@ class MongoEncoder(json.JSONEncoder):
         elif isinstance(obj, datetime.datetime):
             return obj.isoformat()
         return super(MongoEncoder, self).default(obj)
-
 
 class MangoServer(object):
 
@@ -79,8 +73,8 @@ class MangoServer(object):
         self._container_desc_id = "__container_metadata__"
         self.json_ld_profile = "http://www.w3.org/TR/annotation-model/jsonLdProfile"
         self.default_context = "http://www.w3.org/ns/anno.jsonld"
-        self.default_page_size = 1000
-        self.small_page_size = 100
+        self.uri_page_size = 1000
+        self.description_page_size = 100
 
         self.rdflib_format_map = {
               'application/rdf+xml' : 'pretty-xml',
@@ -111,6 +105,7 @@ class MangoServer(object):
         if value.find('#') > -1: return False
         if value.find('%') > -1: return False
         if value.find('?') > -1: return False
+        if value == self._container_desc_id: return False
         value = value.replace(' ', '+')
         value = value.replace('[', '')
         value = value.replace(']', '')
@@ -238,82 +233,110 @@ class MangoServer(object):
         return out
 
 
+    def get_container_projection(self, container, coll, metadata):
+        uri = self._make_uri(container)
+        
+
+    def get_container_base(self, container, coll, metadata):
+        uri = self._make_uri(container)        
+
+        prefer = request.headers.get('Prefer', '')
+        limit = -1
+        include = ''
+        if prefer:
+            prefs = self._parse_prefer(prefer)
+            for p in prefs:
+                if p[0] == ['return', 'representation'] and p[1][0] == 'include':
+                    if p[1][1] == 'http://www.w3.org/ns/ldp#PreferMinimalContainer':                       
+                        # No members
+                        limit = 0
+                        include = 'none'
+                    elif p[1][1] == 'http://www.w3.org/ns/oa#PreferContainedURIs':
+                        # include only URIs
+                        limit = self.uri_page_size
+                        include = 'uri'
+                    elif p[1][1] == '':
+                        # include full descriptions
+                        limit = self.description_page_size
+                        include = 'description'
+                    else:
+                        continue
+                    response['Preference-Applied'] = "return=representation"
+
+        cursor = coll.find({'_id': {'$ne' : self._container_desc_id}}, {'_id':1})
+        totalItems = cursor.count()
+
+        if not include:
+            # Make a sensible default, lacking a client preference
+            if totalItems > self.uri_page_size:
+                # Require pages
+                limit = 0
+                include = 'none'
+                paged = True
+            elif totalItems > self.description_page_size:
+                # Give all URIs
+                limit = self.uri_page_size
+                include = 'uri'
+                paged = False
+            else:
+                # Give descriptions
+                limit = self.description_page_size
+                include = 'description'
+                paged = False
+        elif include == 'uri':
+            # Determine whether we need pages
+            paged = totalItems > self.uri_page_size
+        elif include == 'description':
+            paged = totalItems > self.description_page_size
+        else:
+            paged = False 
+
+        resp = {"@context": "http://www.w3.org/ns/anno.jsonld",
+                "@id": uri,            
+                "@type": ["BasicContainer"],
+                "totalItems" : totalItems} 
+        resp.update(metadata)
+
+        if not paged:
+            # Make a full response and deliver back
+            resp['@type'].append('Container')
+            if include == 'description':
+                cursor = coll.find({'_id': {'$ne' : self._container_desc_id}})
+            included = []
+            for what in cursor:
+                myid = what['_id']
+                out = self._fix_json(what)
+                out['@id'] = self._make_uri(container, self._unmake_id(myid))           
+                included.append(out)
+            resp['contains'] = included
+        else:
+            # Make a top level paged response
+            resp['@type'].append('OrderedContainer')
+
+
+
     def get_container(self, container):
+        # reroute
+
         coll = self._collection(container)
         metadata = coll.find_one({"_id": self._container_desc_id})
         if metadata == None:
             abort(404, "Unknown container")
 
-        limit = request.query.get('limit', -1)  # -1 = Use a default
-        offset = request.query.get('offset', -1) # -1 = Not a page
-
-        # Other params might make it a search?
-
-        uri = self._make_uri(container)
-
-        prefer = request.headers.get('Prefer', '')
-        # http://tools.ietf.org/html/rfc7240
-        if prefer:
-            prefs = self._parse_prefer(prefer)
-            for p in prefs:
-                if p[0] == ['return', 'representation']:
-                    if p[1] == ['omit', 'http://www.w3.org/ns/ldp#PreferContainment']:
-                        # No members
-                        limit = 0
-                        response['Preference-Applied'] = "return=representation"
-                    elif p[1].has_key('max-member-count'):
-                        limit = int(p[1]['max-member-count'])
-                        response['Preference-Applied'] = "return=representation"                        
-                        if limit < 1:
-                            abort(400, "max-member-count must be 1 or higher")
-            if limit > 0:
-                # This doesn't actually conform :(
-                loc = "{0}?limit={1}&offset=0".format(uri, limit)
-                redirect(loc, 303)
-
-        cursor = coll.find({'_id': {'$ne' : self._container_desc_id}}, {'_id':1, '@type': 1})
-        totalItems = cursor.count()
-
-        # Put everything in if count is small
-        if totalItems < limit and totalItems <= self.small_page_size:
-            cursor = coll.find({'_id': {'$ne' : self._container_desc_id}})            
-
-        if not limit:
-            included = []
+        if request.query.keys():
+            # We're a page or projection
+            return self.get_container_projection(container, coll, metadata)
         else:
-            if limit < 0:
-                limit = self.default_page_size
-            else:
-                try:
-                    limit = int(limit)
-                except:
-                    abort(400, "Limit must be an integer")
+            # We're the full container
+            return self.get_container_base(container, coll, metadata)
 
-            if offset == -1:
-                off = 0
-            else:
-                try:
-                    off = int(offset)
-                except:
-                    abort(400, "Offset must be an integer")
 
-            objects = list(cursor.skip(off).limit(limit))
 
-            included = []
-            for what in objects:
-                myid = what['_id']
-                out = self._fix_json(what)
-                out['@id'] = self._make_uri(container, self._unmake_id(myid))           
-                included.append(out)
 
         if offset == -1:
             # Container
-            resp = {"@context": "http://www.w3.org/ns/anno.jsonld",
-                    "@id": uri,            
-                    "@type": ["OrderedCollection", "BasicContainer"],
-                    "totalItems" : totalItems,
-                    "contains": included}      
-            resp.update(metadata)
+     
+            
 
             links = ['<http://www.w3.org/ns/ldp#BasicContainer>;rel="type"', 
                 '<http://www.w3.org/TR/annotation-protocol/constraints>; rel="http://www.w3.org/ns/ldp#constrainedBy"']
