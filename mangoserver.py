@@ -430,10 +430,6 @@ class MangoServer(object):
             abort(404)
 
         uri = self._make_uri(container, resource)
-
-        # Add static headers
-        response.headers['Link'] = '<{0}>;rel="self", <http://www.w3.org/ns/ldp#Resource>;rel="type"'.format(uri)
-
         return self._conneg(data, uri)
 
     def post_container(self, container):
@@ -470,9 +466,11 @@ class MangoServer(object):
 
     def delete_resource(self, container, resource):
         coll = self._collection(container)
-        coll.remove({"_id": self._make_id(container, resource)})
+        coll.delete_one({"_id": self._make_id(container, resource)})
         response.status = 204
         return ""
+
+
 
     def dispatch_views(self):
         methods = ["get", "post", "put", "patch", "delete", "options"]
@@ -485,7 +483,6 @@ class MangoServer(object):
     def before_request(self):
         # Process incoming application/ld+json as application/json
         self._handle_ld_json()
-
 
     def after_request(self):
         # Add CORS and other static headers
