@@ -375,8 +375,7 @@ class MangoServer(object):
 
 
     def get_container(self, container):
-        # reroute
-
+        # reroute to appropriate handler
         coll = self._collection(container)
         metadata = coll.find_one({"_id": self._container_desc_id})
         if metadata == None:
@@ -434,7 +433,6 @@ class MangoServer(object):
 
     def post_container(self, container):
         coll = self._collection(container)
-
         js = self._fix_json()
         myid = self._make_id(container)
         uri = self._make_uri(container, myid)
@@ -469,8 +467,6 @@ class MangoServer(object):
         coll.delete_one({"_id": self._make_id(container, resource)})
         response.status = 204
         return ""
-
-
 
     def dispatch_views(self):
         methods = ["get", "post", "put", "patch", "delete", "options"]
