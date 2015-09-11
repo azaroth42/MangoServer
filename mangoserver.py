@@ -73,8 +73,8 @@ class MangoServer(object):
         self._container_desc_id = "__container_metadata__"
         self.json_ld_profile = "http://www.w3.org/TR/annotation-model/jsonLdProfile"
         self.default_context = "http://www.w3.org/ns/anno.jsonld"
-        self.uri_page_size = 1000
-        self.description_page_size = 100
+        self.uri_page_size = 500
+        self.description_page_size = 50
         self.server_prefers = "description" # or "uri"
 
         self.rdflib_format_map = {
@@ -85,7 +85,6 @@ class MangoServer(object):
               'application/x-turtle' : 'turtle',
               'text/plain' : 'nt',
               'text/rdf+n3' : 'n3'}
-
 
     def _connect(self, database, host=None, port=None):
         return MongoClient(host=host, port=port)[database]
@@ -236,7 +235,7 @@ class MangoServer(object):
     def get_container_page(self, container, coll, metadata):
         uri = self._make_uri(container)
 
-        include = request.query.get('include', 'description')
+        include = request.query.get('include', self.server_prefers)
         page = request.query.get('page', '0')
         page = int(page)    
         page_size = getattr(self, "{0}_page_size".format(include))        
@@ -250,28 +249,63 @@ class MangoServer(object):
         totalItems = cursor.count()
 
         included = []
-        for what in cursor.offset(offset).limit(page_size):
+        for what in cursor.skip(offset).limit(page_size):
             myid = what['_id']
-            out = self._fix_json(what)
-            out['@id'] = self._make_uri(container, self._unmake_id(myid))           
-            included.append(out)
+            if include == 'uri':
+                included.append(self._make_uri(container, self._unmake_id(myid)))
+            else:
+                out = self._fix_json(what)
+                out['@id'] = self._make_uri(container, self._unmake_id(myid))           
+                try:
+                    del out['@context']
+                except:
+                    pass
+                included.append(out)
+
+        last_page = totalItems / page_size
+        first = "{0}?include={1}&page=0".format(uri, include)
+        last = "{0}?include={1}&page={2}".format(uri, include, last_page)
+        me = "{0}?include={1}&page={2}".format(uri, include, page)
+        curi = "{0}?include={1}".format(uri, include)
 
         resp = {"@context": "http://www.w3.org/ns/anno.jsonld",
-                "@id": uri,            
+                "@id": me,            
                 "@type": "OrderedCollectionPage",
                 "partOf": {
-                    "@id": "",
+                    "@id": curi,
                     "totalItems": totalItems,
-                    "first": "",
-                    "last": ""
+                    "first": first,
+                    "last": last
                 },
                 "orderedItems" : included} 
 
-        return self._conneg(resp, uri)
+        if page != last_page:
+            resp['next'] = '{0}?include={1}&page={2}'.format(uri, include, page+1)
+        if page:
+            resp['prev'] = '{0}?include={1}&page={2}'.format(uri, include, page-1)
+
+        return self._conneg(resp, me)
 
     def get_container_projection(self, container, coll, metadata):
         uri = self._make_uri(container)
-        
+        include = request.query.get('include', self.server_prefers)
+
+        cursor = coll.find({'_id': {'$ne' : self._container_desc_id}}, {'_id':1})
+        totalItems = cursor.count()
+        page_size = getattr(self, "{0}_page_size".format(include))        
+        me = "{0}?include={1}".format(uri, include)
+
+        resp = {"@context": "http://www.w3.org/ns/anno.jsonld",
+                "@id": me,            
+                "totalItems" : totalItems} 
+        resp.update(metadata)
+
+        last = totalItems/page_size;
+        resp['first'] = "{0}?include={1}&page=0".format(uri, include)
+        resp['last'] = "{0}?include={1}&page={2}".format(uri, include, last)
+
+        return self._conneg(resp, me)
+
 
     def get_container_base(self, container, coll, metadata):
         uri = self._make_uri(container)        
@@ -281,15 +315,15 @@ class MangoServer(object):
         if prefer:
             prefs = self._parse_prefer(prefer)
             for p in prefs:
-                if p[0] == ['return', 'representation'] and p[1][0] == 'include':
-                    if p[1][1] == 'http://www.w3.org/ns/ldp#PreferMinimalContainer':                       
+                if p[0] == ['return', 'representation']:
+                    if p[1]['include'] == 'http://www.w3.org/ns/ldp#PreferMinimalContainer':                       
                         # No members
                         include = 'none'
                         paged = False
-                    elif p[1][1] == 'http://www.w3.org/ns/oa#PreferContainedURIs':
+                    elif p[1]['include'] == 'http://www.w3.org/ns/oa#PreferContainedURIs':
                         # include only URIs
                         include = 'uri'
-                    elif p[1][1] == 'http://www.w3.org/ns/oa#PreferContainedDescriptions':
+                    elif p[1]['include'] == 'http://www.w3.org/ns/oa#PreferContainedDescriptions':
                         # include full descriptions
                         include = 'description'
                     else:
@@ -320,7 +354,6 @@ class MangoServer(object):
         if not paged and not ordered:
             resp = {"@context": "http://www.w3.org/ns/anno.jsonld",
                     "@id": uri,            
-                    "@type": ["BasicContainer"],
                     "totalItems" : totalItems} 
             resp.update(metadata)
 
@@ -349,10 +382,10 @@ class MangoServer(object):
         if metadata == None:
             abort(404, "Unknown container")
 
-        if request.query.has_key('page'):
+        if request.query.get('page', ''):
             # We're a page
             return self.get_container_page(container, coll, metadata)
-        elif request.query.has_key('include'):
+        elif request.query.get('include', ''):
             # We're a projection
             return self.get_container_projection(container, coll, metadata)
         else:
@@ -369,7 +402,10 @@ class MangoServer(object):
         if metadata == None:
             metadata = js
             metadata["_id"] = self._container_desc_id
-            del metadata['@id']
+            try:
+                del metadata['@id']
+            except:
+                pass
             current = coll.insert_one(metadata)
             response.status = 201
         else:

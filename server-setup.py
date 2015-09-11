@@ -6,8 +6,8 @@ import sys
 
 container = {
  "@context": "http://www.w3.org/ns/anno.jsonld",
- "@type": "ldp:BasicContainer",
- "dc:title": "A Basic Annotation Container"
+ "@type": ["BasicContainer", "OrderedCollection"],
+ "label": "A Basic Annotation Container"
 }
 
 anno = {
@@ -30,6 +30,13 @@ if '--delete-container' in sys.argv:
 if '--annotation' in sys.argv:
 	data = json.dumps(anno)
 	req = requests.post(url=url, data=data, headers=hdrs)	
+
+if '--many-annotations' in sys.argv:
+	for x in range(1000):
+		anno['body']['value'] = "Annotation {0}".format(x)
+		hdrs['Slug'] = 'anno_{0}'.format(x)
+		data = json.dumps(anno)
+		req = requests.post(url=url, data=data, headers=hdrs)
 
 if '--slug-annotation' in sys.argv:
 	data = json.dumps(anno)
