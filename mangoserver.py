@@ -75,6 +75,7 @@ class MangoServer(object):
         self.default_context = "http://www.w3.org/ns/anno.jsonld"
         self.uri_page_size = 1000
         self.description_page_size = 100
+        self.server_prefers = "description" # or "uri"
 
         self.rdflib_format_map = {
               'application/rdf+xml' : 'pretty-xml',
@@ -232,6 +233,41 @@ class MangoServer(object):
         response['content_type'] = ct
         return out
 
+    def get_container_page(self, container, coll, metadata):
+        uri = self._make_uri(container)
+
+        include = request.query.get('include', 'description')
+        page = request.query.get('page', '0')
+        page = int(page)    
+        page_size = getattr(self, "{0}_page_size".format(include))        
+        offset = page * page_size
+
+        if include == 'description':
+            cursor = coll.find({'_id': {'$ne' : self._container_desc_id}})
+        else:
+            cursor = coll.find({'_id': {'$ne' : self._container_desc_id}}, {'_id':1})
+
+        totalItems = cursor.count()
+
+        included = []
+        for what in cursor.offset(offset).limit(page_size):
+            myid = what['_id']
+            out = self._fix_json(what)
+            out['@id'] = self._make_uri(container, self._unmake_id(myid))           
+            included.append(out)
+
+        resp = {"@context": "http://www.w3.org/ns/anno.jsonld",
+                "@id": uri,            
+                "@type": "OrderedCollectionPage",
+                "partOf": {
+                    "@id": "",
+                    "totalItems": totalItems,
+                    "first": "",
+                    "last": ""
+                },
+                "orderedItems" : included} 
+
+        return self._conneg(resp, uri)
 
     def get_container_projection(self, container, coll, metadata):
         uri = self._make_uri(container)
@@ -241,7 +277,6 @@ class MangoServer(object):
         uri = self._make_uri(container)        
 
         prefer = request.headers.get('Prefer', '')
-        limit = -1
         include = ''
         if prefer:
             prefs = self._parse_prefer(prefer)
@@ -249,15 +284,13 @@ class MangoServer(object):
                 if p[0] == ['return', 'representation'] and p[1][0] == 'include':
                     if p[1][1] == 'http://www.w3.org/ns/ldp#PreferMinimalContainer':                       
                         # No members
-                        limit = 0
                         include = 'none'
+                        paged = False
                     elif p[1][1] == 'http://www.w3.org/ns/oa#PreferContainedURIs':
                         # include only URIs
-                        limit = self.uri_page_size
                         include = 'uri'
-                    elif p[1][1] == '':
+                    elif p[1][1] == 'http://www.w3.org/ns/oa#PreferContainedDescriptions':
                         # include full descriptions
-                        limit = self.description_page_size
                         include = 'description'
                     else:
                         continue
@@ -268,51 +301,44 @@ class MangoServer(object):
 
         if not include:
             # Make a sensible default, lacking a client preference
-            if totalItems > self.uri_page_size:
-                # Require pages
-                limit = 0
-                include = 'none'
-                paged = True
-            elif totalItems > self.description_page_size:
-                # Give all URIs
-                limit = self.uri_page_size
-                include = 'uri'
-                paged = False
-            else:
-                # Give descriptions
-                limit = self.description_page_size
-                include = 'description'
-                paged = False
+            include = self.server_prefers
+            max_prefers = getattr(self, "{0}_page_size".format(include))
+            paged = totalItems > max_prefers
         elif include == 'uri':
             # Determine whether we need pages
             paged = totalItems > self.uri_page_size
         elif include == 'description':
             paged = totalItems > self.description_page_size
+
+        # Allow collection to determine its orderedness
+        t = metadata['@type']        
+        if type(t) == list:
+            ordered = 'OrderedCollection' in t
         else:
-            paged = False 
+            ordered = t == 'OrderedCollection'
 
-        resp = {"@context": "http://www.w3.org/ns/anno.jsonld",
-                "@id": uri,            
-                "@type": ["BasicContainer"],
-                "totalItems" : totalItems} 
-        resp.update(metadata)
+        if not paged and not ordered:
+            resp = {"@context": "http://www.w3.org/ns/anno.jsonld",
+                    "@id": uri,            
+                    "@type": ["BasicContainer"],
+                    "totalItems" : totalItems} 
+            resp.update(metadata)
 
-        if not paged:
-            # Make a full response and deliver back
-            resp['@type'].append('Container')
-            if include == 'description':
-                cursor = coll.find({'_id': {'$ne' : self._container_desc_id}})
-            included = []
-            for what in cursor:
-                myid = what['_id']
-                out = self._fix_json(what)
-                out['@id'] = self._make_uri(container, self._unmake_id(myid))           
-                included.append(out)
-            resp['contains'] = included
+            if include != 'none':
+                if include == 'description':
+                    cursor = coll.find({'_id': {'$ne' : self._container_desc_id}})
+                included = []
+                for what in cursor:
+                    myid = what['_id']
+                    out = self._fix_json(what)
+                    out['@id'] = self._make_uri(container, self._unmake_id(myid))           
+                    included.append(out)
+                resp['contains'] = included
+            return self._conneg(resp, uri)
         else:
-            # Make a top level paged response
-            resp['@type'].append('OrderedContainer')
-
+            # Redirect to new URI, as we're paged
+            newuri = "{0}?include={1}".format(uri, include)
+            redirect(newuri, 303)
 
 
     def get_container(self, container):
@@ -323,37 +349,16 @@ class MangoServer(object):
         if metadata == None:
             abort(404, "Unknown container")
 
-        if request.query.keys():
-            # We're a page or projection
+        if request.query.has_key('page'):
+            # We're a page
+            return self.get_container_page(container, coll, metadata)
+        elif request.query.has_key('include'):
+            # We're a projection
             return self.get_container_projection(container, coll, metadata)
         else:
             # We're the full container
             return self.get_container_base(container, coll, metadata)
 
-
-
-
-        if offset == -1:
-            # Container
-     
-            
-
-            links = ['<http://www.w3.org/ns/ldp#BasicContainer>;rel="type"', 
-                '<http://www.w3.org/TR/annotation-protocol/constraints>; rel="http://www.w3.org/ns/ldp#constrainedBy"']
-        else:
-            # Page
-            resp = {"@context": "http://www.w3.org/ns/anno.jsonld",
-                    "@id": "{0}?limit={1}&offset={2}".format(uri, limit, off),
-                    "@type": "OrderedCollectionPage",
-                    "totalItems" : totalItems,
-                    "orderedItems": included}
-            links = []
-
-        # Add required headers
-        response['Link'] = ', '.join(links)
-        response['Allow'] = 'GET,POST,PUT,DELETE,OPTIONS,HEAD'
-
-        return self._conneg(resp, uri)
 
     def put_container(self, container):
         # Grab the body and put it into magic __container_metadata__
