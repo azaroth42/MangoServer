@@ -8,14 +8,15 @@ import json
 from functools import partial
 import uuid
 import datetime
+import time
 import hashlib
+from collections import OrderedDict
 
 from bottle import Bottle, route, run, request, response, abort, error, redirect
 
 # Requires pymongo 3.x
 from bson import ObjectId
 from pymongo import MongoClient
-
 from rdflib import Graph
 from pyld import jsonld
 
@@ -40,7 +41,6 @@ def load_document_local(url):
 
 jsonld.set_document_loader(load_document_local)
 
-
 class MongoEncoder(json.JSONEncoder):
     def default(self, obj):
         if isinstance(obj, ObjectId):
@@ -52,7 +52,7 @@ class MongoEncoder(json.JSONEncoder):
 class MangoServer(object):
 
     def __init__(self, database="mango", host='localhost', port=27017,
-                 sort_keys=True, compact_json=False, indent_json=2,
+                 sort_keys=True, human_sort_keys=True, compact_json=False, indent_json=2,
                  url_host="http://localhost:8000/", url_prefix="", json_ld=True):
 
         # Mongo Connection
@@ -63,19 +63,28 @@ class MangoServer(object):
 
         # JSON Serialization options
         self.sort_keys = sort_keys
+        self.human_sort_keys = human_sort_keys
         self.compact_json = compact_json
         self.indent_json = indent_json
         self.json_content_type = "application/ld+json" if json_ld else "application/json"
 
+        self.known_profiles = ["http://iiif.io/api/presentation/2/context.json",
+             "http://www.w3.org/ns/oa.jsonld",
+             "http://www.w3.org/ns/oa-context-20130208.json",
+             'http://www.w3.org/ns/anno.jsonld']
+        self.default_profile = 'http://www.w3.org/ns/anno.jsonld'
+
         self.url_host = url_host
         self.url_prefix = url_prefix
+        self.server_identity = {"type": "Software", "label": "MangoServer v0.9", "homepage": "https://github.com/azaroth42/MangoServer/"}
 
         self._container_desc_id = "__container_metadata__"
-        self.json_ld_profile = "http://www.w3.org/TR/annotation-model/jsonLdProfile"
+        self.json_ld_profile = "http://www.w3.org/ns/anno.jsonld"
         self.default_context = "http://www.w3.org/ns/anno.jsonld"
         self.uri_page_size = 500
-        self.description_page_size = 50
+        self.description_page_size = 20
         self.server_prefers = "description" # or "uri"
+        self.require_if_match = True
 
         self.rdflib_format_map = {
               'application/rdf+xml' : 'pretty-xml',
@@ -85,6 +94,18 @@ class MangoServer(object):
               'application/x-turtle' : 'turtle',
               'text/plain' : 'nt',
               'text/rdf+n3' : 'n3'}
+
+        self.key_order = ['@context', 'id', 'type', 'label', 'name', 'account', 'motivation',
+            'creator', 'created', 'modified', 'generator', 'generated', 'audience', 'via', 'canonical', 
+            'stylesheet', 'purpose', 'value', 'format', 'language', 'start', 'end', 'prefix', 'exact', 
+            'suffix', 'body', 'bodyValue', 'target', 'total', 'partOf', 'first', 'last', 'state', 'selector',
+            'styleClass', 'scope', 'renderedVia', 'source']
+        self.key_order_hash = dict([(self.key_order[x],x) for x in range(len(self.key_order))])
+        self.key_order_default = 1000
+        # make sure structures and long lists are at the end
+        self.key_order_hash['refinedBy'] = 4000
+        self.key_order_hash['items'] = 5000
+        self.key_order_hash['contains'] = 5001
 
     def _connect(self, database, host=None, port=None):
         return MongoClient(host=host, port=port)[database]
@@ -131,33 +152,85 @@ class MangoServer(object):
             return value
 
     def _handle_ld_json(self):
+        b = request._get_body_string()
         if request.headers.get('Content-Type', '').strip().startswith("application/ld+json"):
             # put the json into request.json, like application/json does automatically
-            b = request._get_body_string()
+            # Except it doesn't seem to work :(
             if b:
-                request.json = json.loads(b)
+                request._json = json.loads(b)
+            else:
+                request._json = request.json
+        elif b:
+            print "Got {0} for body: {1}".format(request.headers['Content-Type'], b)
 
-    def _fix_json(self, js={}):
+
+    def _fix_json(self, js={}, via=False):
         # Validate / Patch JSON
         if not js:
             try:    
-                js = request.json
-            except:
-                abort(400, "JSON is not well formed")
+                js = request._json
+                if not js:
+                    abort(400, "Empty JSON")
+            except Exception, e:
+                abort(400, "JSON is not well formed: {0}".format(e))
         if js.has_key('_id'):
             del js['_id']
-        if js.has_key('@id'):
-            del js['@id']
+        if js.has_key('id'):
+            # Record old IRI in via
+            if via:
+                if js.has_key('via'):
+                    v = js['via']
+                    if type(v) != list:
+                        v = [v]
+                    if not js['id'] in v:
+                        v.append(js['id'])
+                        js['via'] = v
+                else:
+                    js['via'] = js['id']
+            del js['id']
         return js
 
+    def decorate_annotation(self, js):
+        now = time.strftime("%Y-%m-%dT%H:%m:%SZ", time.gmtime())
+        if not js.has_key('created'):
+            # Add created now() as created time
+            js['created'] = now
+        else:
+            js['modified'] = now
+        # if we have authentication, then add user attributes
+        if not js.has_key('canonical') and not js.has_key('via'):
+            js['canonical'] = js['id']
+        js['generator'] = self.server_identity
+        return js
+
+    def _jsonify_human(self, what):
+            what = OrderedDict(sorted(what.items(), 
+                key=lambda x: self.key_order_hash.get(x[0], self.key_order_default)))
+            for k,v in what.items():
+                if type(v) == dict:
+                    what[k] = self._jsonify_human(v)
+                elif type(v) == list:
+                    nl = []
+                    for i in v:
+                        if type(i) == dict:
+                            nl.append(self._jsonify_human(i))
+                        else:
+                            nl.append(i)
+                    what[k] = nl
+            return what
+
     def _jsonify(self, what, uri):
-        what['@id'] = uri
+        what['id'] = uri
         try:
             del what['_id']
         except:
             pass            
         if self.compact_json:
             me = MongoEncoder(sort_keys=self.sort_keys, separators=(',',':'))
+        if self.human_sort_keys:
+            me = MongoEncoder(sort_keys=False, indent=self.indent_json)
+            # Rebuild ALL the json with OrderedDicts
+            what = self._jsonify_human(what)
         else:
             me = MongoEncoder(sort_keys=self.sort_keys, indent=self.indent_json)
         return me.encode(what)
@@ -182,7 +255,6 @@ class MangoServer(object):
         return prefs
 
     def _parse_prefer(self, value):
-
         prefs = []
         for item in value.split(","):
             parts = item.split(";")
@@ -203,9 +275,9 @@ class MangoServer(object):
 
     def _conneg(self, data, uri):
         # Content Negotiate with client
-
         out = self._jsonify(data, uri)
 
+        # We're on our way out the door ...
         # Construct our ETag from the JSON first
         h = hashlib.md5()
         h.update(out)
@@ -223,6 +295,14 @@ class MangoServer(object):
                     break
                 elif p[0] in ['application/json', 'application/ld+json']:
                     ct = p[0]
+                    if "profile" in p[1]:
+                        prof = p[1]['profile']
+                        if prof in self.known_profiles:
+                            ct += ';profile="{0}"'.format(prof)
+                            if prof != self.default_profile:
+                                # XXX reframe our content
+                                # See Context Switcher code
+                                pass
                     break
             if format:
                 g = Graph()
@@ -231,6 +311,18 @@ class MangoServer(object):
 
         response['content_type'] = ct
         return out
+
+    def add_link_header(self, uri, params):
+        # XXX Make this less ugly
+        l = "<{0}>".format(uri)
+        if params:
+            p = ['{0}="{1}"'.format(k,v) for k,v in params.items()]
+            l += ";"
+            l += ";".join(p)
+        if 'link' in response.headers:
+            response.headers['link'] += ", {0}".format(l)
+        else:
+            response.headers['link'] = l
 
     def get_container_page(self, container, coll, metadata):
         uri = self._make_uri(container)
@@ -255,7 +347,7 @@ class MangoServer(object):
                 included.append(self._make_uri(container, self._unmake_id(myid)))
             else:
                 out = self._fix_json(what)
-                out['@id'] = self._make_uri(container, self._unmake_id(myid))           
+                out['id'] = self._make_uri(container, self._unmake_id(myid))           
                 try:
                     del out['@context']
                 except:
@@ -269,21 +361,21 @@ class MangoServer(object):
         curi = "{0}?include={1}".format(uri, include)
 
         resp = {"@context": "http://www.w3.org/ns/anno.jsonld",
-                "@id": me,            
-                "@type": "OrderedCollectionPage",
+                "id": me,            
+                "type": "AnnotationPage",
                 "partOf": {
-                    "@id": curi,
-                    "totalItems": totalItems,
-                    "first": first,
-                    "last": last
+                    "id": curi,
+                    "total": totalItems
                 },
-                "orderedItems" : included} 
+                "items" : included} 
 
+        if me != first:
+            resp['partOf']['first'] = first
         if page != last_page:
             resp['next'] = '{0}?include={1}&page={2}'.format(uri, include, page+1)
+            resp['partOf']['last'] = last
         if page:
             resp['prev'] = '{0}?include={1}&page={2}'.format(uri, include, page-1)
-
         return self._conneg(resp, me)
 
     def get_container_projection(self, container, coll, metadata):
@@ -296,8 +388,8 @@ class MangoServer(object):
         me = "{0}?include={1}".format(uri, include)
 
         resp = {"@context": "http://www.w3.org/ns/anno.jsonld",
-                "@id": me,            
-                "totalItems" : totalItems} 
+                "id": me,            
+                "items" : totalItems} 
         resp.update(metadata)
 
         last = totalItems/page_size;
@@ -345,16 +437,13 @@ class MangoServer(object):
             paged = totalItems > self.description_page_size
 
         # Allow collection to determine its orderedness
-        t = metadata['@type']        
-        if type(t) == list:
-            ordered = 'OrderedCollection' in t
-        else:
-            ordered = t == 'OrderedCollection'
+        t = metadata['type']        
 
-        if not paged and not ordered:
-            resp = {"@context": "http://www.w3.org/ns/anno.jsonld",
-                    "@id": uri,            
-                    "totalItems" : totalItems} 
+        if not paged:
+            resp = {"@context": ["http://www.w3.org/ns/anno.jsonld",
+                    "http://www.w3c.org/ns/ldp.jsonld"],
+                    "id": uri,            
+                    "total" : totalItems} 
             resp.update(metadata)
 
             if include != 'none':
@@ -364,7 +453,7 @@ class MangoServer(object):
                 for what in cursor:
                     myid = what['_id']
                     out = self._fix_json(what)
-                    out['@id'] = self._make_uri(container, self._unmake_id(myid))           
+                    out['id'] = self._make_uri(container, self._unmake_id(myid))           
                     included.append(out)
                 resp['contains'] = included
             return self._conneg(resp, uri)
@@ -373,7 +462,6 @@ class MangoServer(object):
             newuri = "{0}?include={1}".format(uri, include)
             redirect(newuri, 303)
 
-
     def get_container(self, container):
         # reroute to appropriate handler
         coll = self._collection(container)
@@ -381,16 +469,20 @@ class MangoServer(object):
         if metadata == None:
             abort(404, "Unknown container")
 
+        self.add_link_header('http://www.w3.org/ns/ldp#BasicContainer', {'rel':'type'})
+        self.add_link_header('http://www.w3.org/TR/annotation-protocol/', {'rel': 'http://www.w3.org/ns/ldp#constrainedBy'})
+
         if request.query.get('page', ''):
-            # We're a page
+            # We're a paged
+            self.add_link_header('http://www.w3.org/ns/oa#AnnotationPage', {'rel':'type'})
             return self.get_container_page(container, coll, metadata)
         elif request.query.get('include', ''):
             # We're a projection
             return self.get_container_projection(container, coll, metadata)
         else:
             # We're the full container
+            self.add_link_header('http://www.w3.org/ns/oa#AnnotationCollection', {'rel':'type'})
             return self.get_container_base(container, coll, metadata)
-
 
     def put_container(self, container):
         # Grab the body and put it into magic __container_metadata__
@@ -402,7 +494,7 @@ class MangoServer(object):
             metadata = js
             metadata["_id"] = self._container_desc_id
             try:
-                del metadata['@id']
+                del metadata['id']
             except:
                 pass
             current = coll.insert_one(metadata)
@@ -427,49 +519,80 @@ class MangoServer(object):
         data = coll.find_one({"_id": self._make_id(container, resource)})
         if not data:
             abort(404)
-
         uri = self._make_uri(container, resource)
         return self._conneg(data, uri)
 
     def post_container(self, container):
         coll = self._collection(container)
-        js = self._fix_json()
+        js = self._fix_json(via=True)
         myid = self._make_id(container)
         uri = self._make_uri(container, myid)
+        js = self.decorate_annotation(js)
         js["_id"] = myid
         inserted = coll.insert_one(js)
         response.status = 201
         return self._conneg(js, uri)
 
+    def post_resource(self, container, resource):
+        abort(400, "Cannot POST to an individual resource, use PUT or POST to a container")
+
+    def check_if_match(self, coll, container, resource):
+        if 'if-match' in request.headers:
+            check = request.headers['if-match']
+            data = coll.find_one({"_id": self._make_id(container, resource)})
+            if not data:
+                abort(404)
+
+            uri = self._make_uri(container, resource)
+            out = self._jsonify(data, uri)
+            h = hashlib.md5()
+            h.update(out)
+            current = h.hexdigest()           
+            if check != current:
+                # Collision
+                abort(412)
+        elif self.require_if_match:
+            abort(412, "No If-Match header for PUT")
+        return True
+
     def put_resource(self, container, resource):
-        coll = self._collection(rtype)
+        # Update individual Annotation
+        coll = self._collection(container)
         js = self._fix_json()
+        self.check_if_match(coll, container, resource) 
         coll.replace_one({"_id": self._make_id(container, resource)}, js)
         response.status = 202
         uri = self._make_uri(container, resource)
         return self._conneg(js, uri)
 
-    def post_resource(self, container, resource):
-        abort(400, "Cannot POST to an individual resource, use PUT or POST to a container")
-
     def patch_resource(self, container, resource):
         coll = self._collection(container)
-
-        # XXX Need to process some patch format
-
-        coll.update_one({"_id": ObjectId(self._make_id(container, resource))},
-                          {"$set": request.json})
+        self.check_if_match(coll, container, resource) 
+        coll.update_one({"_id": self._make_id(container, resource)},
+                          {"$set": request._json})
         response.status = 202
         return self.get_resource(container, resource)
 
     def delete_resource(self, container, resource):
         coll = self._collection(container)
+        uri = self._make_uri(container, resource) 
+        self.check_if_match(coll, container, resource)
         coll.delete_one({"_id": self._make_id(container, resource)})
         response.status = 204
         return ""
 
+    def head_container(self, container):
+        val = self.get_container(container)
+        response.headers['Content-Length'] = len(val)
+        return ""
+
+    def head_resource(self, container, resource):
+        val = self.get_resource(container, resource)
+        response.headers['Content-Length'] = len(val)
+        return ""
+
     def dispatch_views(self):
-        methods = ["get", "post", "put", "patch", "delete", "options"]
+        methods = ["get", "head", "post", "put", "patch", "delete", "options"]
         for m in methods:
             self.app.route('/%s<container:re:.*>/' % self.url_prefix,
                 [m], getattr(self, "%s_container" % m, self.not_implemented))
@@ -482,13 +605,11 @@ class MangoServer(object):
 
     def after_request(self):
         # Add CORS and other static headers
-        methods = 'PUT, PATCH, GET, POST, DELETE, OPTIONS'
-        headers = 'Origin, Accept, Content-Type, X-Requested-With'
+        methods = 'PUT, PATCH, GET, POST, DELETE, OPTIONS, HEAD'
         response.headers['Access-Control-Allow-Origin'] = '*'
         response.headers['Access-Control-Allow-Methods'] = methods
-        response.headers['Access-Control-Allow-Headers'] = headers
+        response.headers['Allow'] = methods
         response.headers['Vary'] = "Accept"
-
 
     def not_implemented(self, *args, **kwargs):
         """Returns not implemented status."""
@@ -497,9 +618,8 @@ class MangoServer(object):
     def empty_response(self, *args, **kwargs):
         """Empty response"""
 
-    options_single = empty_response
-    options_multiple = empty_response
-
+    options_container = empty_response
+    options_resource = empty_response
 
     def error(self, error, message=None):
         # Make a little error message in JSON-LD
@@ -508,12 +628,13 @@ class MangoServer(object):
 
     def get_error_handler(self):
         return {
-            500: partial(self.error, message="Internal Server Error."),
-            404: partial(self.error, message="Document Not Found."),
-            501: partial(self.error, message="Not Implemented."),
-            405: partial(self.error, message="Method Not Allowed."),
-            403: partial(self.error, message="Forbidden."),
-            400: self.error
+            500: partial(self.error, message="Internal Server Error"),
+            404: partial(self.error, message="Not Found"),
+            501: partial(self.error, message="Not Implemented"),
+            405: partial(self.error, message="Method Not Allowed"),
+            403: partial(self.error, message="Forbidden"),
+            412: partial(self.error, message="Precondition Failed"),
+            400: partial(self.error, message="Client Error")
         }
 
     def get_bottle_app(self):
@@ -544,7 +665,7 @@ def main():
                        help="Should json output have compact whitespace?")
     parser.add_option('--indent-json', dest="indent_json", default=2, type=int,
                        help="Number of spaces to indent json output")
-    parser.add_option('--json-ld', dest="json_ld", default=False,
+    parser.add_option('--json-ld', dest="json_ld", default=True,
                        help="Should return json-ld media type instead of json?")
     parser.add_option('--debug', dest="debug", default=True)
 
