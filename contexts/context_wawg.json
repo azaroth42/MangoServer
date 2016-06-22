@@ -63,6 +63,10 @@
     "reviewing":     "oa:reviewing",
     "tagging":       "oa:tagging",
 
+    "auto":          "oa:autoDirection",
+    "ltr":           "oa:ltrDirection",
+    "rtl":           "oa:rtlDirection",
+
     "body":          {"@type": "@id", "@id": "oa:hasBody"},
     "target":        {"@type": "@id", "@id": "oa:hasTarget"},
     "source":        {"@type": "@id", "@id": "oa:hasSource"},
@@ -91,10 +95,13 @@
     "audience":      {"@type": "@id", "@id": "schema:audience"},
     "motivation":    {"@type": "@vocab", "@id": "oa:motivatedBy"},
     "purpose":       {"@type": "@vocab", "@id": "oa:hasPurpose"},
+    "textDirection": {"@type": "@vocab", "@id": "oa:textDirection"},
 
+    "accessibility": "schema:accessibilityFeature",
     "bodyValue":     "oa:bodyValue",
     "format":        "dc:format",
     "language":      "dc:language",
+    "processingLanguage": "oa:processingLanguage",
     "value":         "rdf:value",
     "exact":         "oa:exact",
     "prefix":        "oa:prefix",
@@ -103,7 +110,7 @@
     "name":          "foaf:name",
     "email":         "foaf:mbox",
     "email_sha1":    "foaf:mbox_sha1sum",
-    "account":       "foaf:nick",
+    "nickname":       "foaf:nick",
     "label":         "rdfs:label",
 
     "created":       {"@id": "dcterms:created", "@type": "xsd:dateTime"},
@@ -114,7 +121,7 @@
     "sourceDateEnd": {"@id": "oa:sourceDateEnd", "@type": "xsd:dateTime"},
 
     "start":         {"@id": "oa:start", "@type": "xsd:nonNegativeInteger"},
-    "end":           "oa:end", "@type": "xsd:nonNegativeInteger"},
+    "end":           {"@id": "oa:end", "@type": "xsd:nonNegativeInteger"},
     "total":         {"@id": "as:totalItems", "@type": "xsd:nonNegativeInteger"},
     "startIndex":    {"@id": "as:startIndex", "@type": "xsd:nonNegativeInteger"}
   }

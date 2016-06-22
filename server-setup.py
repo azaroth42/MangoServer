@@ -92,7 +92,33 @@ if '--delete' in sys.argv:
 	rnd = random.randrange(0, len(annos))
 	annoUrl = annos[rnd]['id']
 
-	req = requests.delete(url=annoUrl)
+	req = requests.get(url=annoUrl)
+	et = req.headers['etag']
+	hdrs['If-Match'] = et
+	req = requests.delete(url=annoUrl, headers=hdrs)
+
+
+ 
+if '--ttl' in sys.argv:
+	# First get list of annotations
+
+	annoUrl = "http://localhost:8000/annos/my_first_annoation"
+
+
+	# Fetch it as turtle
+	fetchHdrs = {"Accept": "text/turtle"}
+	req = requests.get(url=annoUrl, headers=fetchHdrs)
+	body = req.text
+	print body
+
+	body = body.replace("this thing", 'this thing FROM TURTLE :)')
+
+	ttlhdrs = {"Content-Type": "text/turtle"}
+	et = req.headers['etag']
+	ttlhdrs['If-Match'] = et
+
+	req = requests.put(url=annoUrl, data=body, headers=ttlhdrs)
+	print req.text
 
 
 if '--patch' in sys.argv:

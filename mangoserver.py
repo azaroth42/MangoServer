@@ -19,9 +19,16 @@ from bson import ObjectId
 from pymongo import MongoClient
 from rdflib import Graph
 from pyld import jsonld
+from pyld.jsonld import compact, expand, frame
 
 # Stop code from looking up the contexts online EVERY TIME
+
+docCache = {}
+
 def load_document_local(url):
+    if docCache.has_key(url):
+        return docCache[url]
+
     doc = {
         'contextUrl': None,
         'documentUrl': None,
@@ -37,6 +44,7 @@ def load_document_local(url):
     data = fh.read()
     fh.close()
     doc['document'] = data;
+    docCache[url] = doc
     return doc
 
 jsonld.set_document_loader(load_document_local)
@@ -85,6 +93,44 @@ class MangoServer(object):
         self.description_page_size = 20
         self.server_prefers = "description" # or "uri"
         self.require_if_match = True
+
+        fh = file('contexts/annotation_frame.jsonld')
+        data = fh.read()
+        fh.close()
+        self.annoframe = json.loads(data)
+
+        self.rdflib_class_map = {
+            "Annotation":           "oa:Annotation",
+            "Dataset":              "dctypes:Dataset",
+            "Image":                "dctypes:StillImage",
+            "Video":                "dctypes:MovingImage",
+            "Audio":                "dctypes:Sound",
+            "Text":                 "dctypes:Text",
+            "TextualBody":          "oa:TextualBody",
+            "ResourceSelection":    "oa:ResourceSelection",
+            "SpecificResource":     "oa:SpecificResource",
+            "FragmentSelector":     "oa:FragmentSelector",
+            "CssSelector":          "oa:CssSelector",
+            "XPathSelector":        "oa:XPathSelector",
+            "TextQuoteSelector":    "oa:TextQuoteSelector",
+            "TextPositionSelector": "oa:TextPositionSelector",
+            "DataPositionSelector": "oa:DataPositionSelector",
+            "SvgSelector":          "oa:SvgSelector",
+            "RangeSelector":        "oa:RangeSelector",
+            "TimeState":            "oa:TimeState",
+            "HttpState":            "oa:HttpRequestState",
+            "CssStylesheet":        "oa:CssStyle",
+            "Choice":               "oa:Choice",
+            "Composite":            "oa:Composite",
+            "List":                 "oa:List",
+            "Independents":         "oa:Independents",
+            "Person":               "foaf:Person",
+            "Software":             "as:Application",
+            "Organization":         "foaf:Organization",
+            "AnnotationCollection": "as:OrderedCollection",
+            "AnnotationPage":       "as:OrderedCollectionPage",
+            "Audience":             "schema:Audience"
+        }
 
         self.rdflib_format_map = {
               'application/rdf+xml' : 'pretty-xml',
@@ -151,6 +197,36 @@ class MangoServer(object):
         else:
             return value
 
+    def _clean_bnode_ids(self, js):
+        new = {}
+        for (k,v) in js.items():
+            if k == 'id' and v.startswith("_:"):
+                continue
+            elif type(v) == dict:
+                # recurse
+                res = self._clean_bnode_ids(v)
+                new[k] = res
+            else:
+                new[k] = v
+        return new
+
+    def _rdf_to_jsonld(self, b):
+        fmt = request.headers['Content-Type']
+        if self.rdflib_format_map.has_key(fmt):
+            rdftype = self.rdflib_format_map[fmt]
+            g = Graph()
+            g.parse(data=b, format=rdftype)
+            out = g.serialize(format='json-ld')
+            # AND THIS IS WHERE IT GETS CRAAAAAZEEEE...
+            # aka rdflib doesn't do framing so we re-re-parse it
+            j2 = json.loads(out)
+            j2 = {"@context": self.default_context, "@graph": j2}
+            framed = frame(j2, self.annoframe)
+            out = compact(framed, self.default_context)
+            # recursively clean blank node ids
+            out = self._clean_bnode_ids(out)
+            return out
+
     def _handle_ld_json(self):
         b = request._get_body_string()
         if request.headers.get('Content-Type', '').strip().startswith("application/ld+json"):
@@ -161,7 +237,12 @@ class MangoServer(object):
             else:
                 request._json = request.json
         elif b:
-            print "Got {0} for body: {1}".format(request.headers['Content-Type'], b)
+            try:
+                j = self._rdf_to_jsonld(b)
+                if j:
+                    request._json = j
+            except:
+                raise
 
 
     def _fix_json(self, js={}, via=False):
@@ -190,18 +271,44 @@ class MangoServer(object):
             del js['id']
         return js
 
-    def decorate_annotation(self, js):
-        now = time.strftime("%Y-%m-%dT%H:%m:%SZ", time.gmtime())
+    def decorate_annotation(self, js, uri=None):
+        now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         if not js.has_key('created'):
             # Add created now() as created time
             js['created'] = now
         else:
             js['modified'] = now
         # if we have authentication, then add user attributes
+        if not js.has_key('id') and uri is not None:
+            js['id'] = uri
         if not js.has_key('canonical') and not js.has_key('via'):
             js['canonical'] = js['id']
         js['generator'] = self.server_identity
         return js
+
+    def _mk_rdflib_jsonld(self, js):
+        # rdflib's json-ld implementation sucks
+        # Pre-process to make it work
+        # recurse the structure looking for types, and replacing them.
+        new = {}
+        for (k,v) in js.items():
+            if k == 'type':
+                if type(v) == list:
+                    nl = []
+                    for i in v:
+                        if self.rdflib_class_map.has_key(i):
+                            nl.append(self.rdflib_class_map[i])
+                    new['type'] = nl
+                else:
+                    if self.rdflib_class_map.has_key(v):
+                        new['type'] = self.rdflib_class_map[v]
+            elif type(v) == dict:
+                # recurse
+                res = self._mk_rdflib_jsonld(v)
+                new[k] = res
+            else:
+                new[k] = v
+        return new
 
     def _jsonify_human(self, what):
             what = OrderedDict(sorted(what.items(), 
@@ -275,14 +382,10 @@ class MangoServer(object):
 
     def _conneg(self, data, uri):
         # Content Negotiate with client
-        out = self._jsonify(data, uri)
-
         # We're on our way out the door ...
         # Construct our ETag from the JSON first
-        h = hashlib.md5()
-        h.update(out)
-        response['ETag'] = h.hexdigest()
 
+        out = None
         accept = request.headers.get('Accept', '')
         ct = self.json_content_type
         if accept:
@@ -306,11 +409,21 @@ class MangoServer(object):
                     break
             if format:
                 g = Graph()
-                g.parse(data=out, format='json-ld')
+                d2 = self._mk_rdflib_jsonld(data)
+                d2str = self._jsonify(d2, uri)
+                g.parse(data=d2str, format='json-ld')
                 out = g.serialize(format=format)
 
+        hashed = self._jsonify(data, uri)
+        h = hashlib.md5()
+        h.update(hashed)
+
+        response['ETag'] = h.hexdigest()
         response['content_type'] = ct
-        return out
+        if not out:
+            return hashed
+        else:
+            return out
 
     def add_link_header(self, uri, params):
         # XXX Make this less ugly
@@ -454,6 +567,11 @@ class MangoServer(object):
                     myid = what['_id']
                     out = self._fix_json(what)
                     out['id'] = self._make_uri(container, self._unmake_id(myid))           
+                    try:
+                        # XXX This will kill any annotation level extensions
+                        del out['@context']
+                    except:
+                        pass
                     included.append(out)
                 resp['contains'] = included
             return self._conneg(resp, uri)
@@ -527,7 +645,7 @@ class MangoServer(object):
         js = self._fix_json(via=True)
         myid = self._make_id(container)
         uri = self._make_uri(container, myid)
-        js = self.decorate_annotation(js)
+        js = self.decorate_annotation(js, uri)
         js["_id"] = myid
         inserted = coll.insert_one(js)
         response.status = 201
