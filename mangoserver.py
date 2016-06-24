@@ -22,7 +22,6 @@ from pyld import jsonld
 from pyld.jsonld import compact, expand, frame
 
 # Stop code from looking up the contexts online EVERY TIME
-
 docCache = {}
 
 def load_document_local(url):
@@ -91,8 +90,8 @@ class MangoServer(object):
         self.default_context = "http://www.w3.org/ns/anno.jsonld"
         self.uri_page_size = 500
         self.description_page_size = 20
-        self.server_prefers = "description" # or "uri"
-        self.require_if_match = True
+        self.server_prefers = "description"
+        self.require_if_match = False # For testing Mirador
 
         fh = file('contexts/annotation_frame.jsonld')
         data = fh.read()
@@ -383,7 +382,6 @@ class MangoServer(object):
     def _conneg(self, data, uri):
         # Content Negotiate with client
         # We're on our way out the door ...
-        # Construct our ETag from the JSON first
 
         out = None
         accept = request.headers.get('Accept', '')
@@ -508,9 +506,7 @@ class MangoServer(object):
         last = totalItems/page_size;
         resp['first'] = "{0}?include={1}&page=0".format(uri, include)
         resp['last'] = "{0}?include={1}&page={2}".format(uri, include, last)
-
         return self._conneg(resp, me)
-
 
     def get_container_base(self, container, coll, metadata):
         uri = self._make_uri(container)        
@@ -535,7 +531,12 @@ class MangoServer(object):
                         continue
                     response['Preference-Applied'] = "return=representation"
 
-        cursor = coll.find({'_id': {'$ne' : self._container_desc_id}}, {'_id':1})
+        base = {'_id': {'$ne' : self._container_desc_id}}
+        if request.query.get('target', ''):
+            search = self._make_search(base)
+        else:
+            search = base
+        cursor = coll.find(search, {'_id':1})
         totalItems = cursor.count()
 
         if not include:
@@ -549,9 +550,6 @@ class MangoServer(object):
         elif include == 'description':
             paged = totalItems > self.description_page_size
 
-        # Allow collection to determine its orderedness
-        t = metadata['type']        
-
         if not paged:
             resp = {"@context": ["http://www.w3.org/ns/anno.jsonld",
                     "http://www.w3c.org/ns/ldp.jsonld"],
@@ -561,7 +559,7 @@ class MangoServer(object):
 
             if include != 'none':
                 if include == 'description':
-                    cursor = coll.find({'_id': {'$ne' : self._container_desc_id}})
+                    cursor = coll.find(search)
                 included = []
                 for what in cursor:
                     myid = what['_id']
@@ -573,12 +571,25 @@ class MangoServer(object):
                     except:
                         pass
                     included.append(out)
-                resp['contains'] = included
+                resp['first'] = {"type": "AnnotationPage", 'items': included}
             return self._conneg(resp, uri)
         else:
             # Redirect to new URI, as we're paged
             newuri = "{0}?include={1}".format(uri, include)
             redirect(newuri, 303)
+
+    def _make_search(self, terms):
+        # Search for annotations where target is request.query['target']
+        # Can be anno.target, anno.target.id, anno.target.source, anno.target.source.id
+
+        qterm = request.query['target']
+        if qterm.find("#") > -1:
+            qterm = qterm[:qterm.find("#")]
+
+        qterm = {'$regex': '^%s' % qterm}
+        search = {'$or': [{'target': qterm}, {'target.id': qterm}, {'target.source': qterm}, {'target.source.id': qterm}]}
+        return {'$and': [search, terms]}
+    
 
     def get_container(self, container):
         # reroute to appropriate handler
@@ -726,6 +737,7 @@ class MangoServer(object):
         methods = 'PUT, PATCH, GET, POST, DELETE, OPTIONS, HEAD'
         response.headers['Access-Control-Allow-Origin'] = '*'
         response.headers['Access-Control-Allow-Methods'] = methods
+        response.headers['Access-Control-Allow-Headers'] = 'accept,prefer,content-type'
         response.headers['Allow'] = methods
         response.headers['Vary'] = "Accept"
 
@@ -789,7 +801,7 @@ def main():
 
     options, args = parser.parse_args()
 
-    host, port = (options.address or 'localhost'), 8000
+    host, port = (options.address or 'localhost'), 8080
     if ':' in host:
         host, port = host.rsplit(':', 1)
 
