@@ -66,7 +66,7 @@ if '--put' in sys.argv:
 	phdrs = {"Prefer": 'return=representation;include="http://www.w3.org/ns/oa#PreferContainedURIs"'}
 	req = requests.get(url=url, headers=phdrs)
 	body = req.json()
-	annos = body['contains']
+	annos = body['first']['items']
 	rnd = random.randrange(0, len(annos))
 	annoUrl = annos[rnd]['id']
 
@@ -88,7 +88,7 @@ if '--delete' in sys.argv:
 	phdrs = {"Prefer": 'return=representation;include="http://www.w3.org/ns/oa#PreferContainedURIs"'}
 	req = requests.get(url=url, headers=phdrs)
 	body = req.json()
-	annos = body['contains']
+	annos = body['first']['items']
 	rnd = random.randrange(0, len(annos))
 	annoUrl = annos[rnd]['id']
 
@@ -103,8 +103,6 @@ if '--ttl' in sys.argv:
 	# First get list of annotations
 
 	annoUrl = "http://localhost:8000/annos/my_first_annoation"
-
-
 	# Fetch it as turtle
 	fetchHdrs = {"Accept": "text/turtle"}
 	req = requests.get(url=annoUrl, headers=fetchHdrs)
@@ -112,11 +110,9 @@ if '--ttl' in sys.argv:
 	print body
 
 	body = body.replace("this thing", 'this thing FROM TURTLE :)')
-
 	ttlhdrs = {"Content-Type": "text/turtle"}
 	et = req.headers['etag']
 	ttlhdrs['If-Match'] = et
-
 	req = requests.put(url=annoUrl, data=body, headers=ttlhdrs)
 	print req.text
 
@@ -125,7 +121,7 @@ if '--patch' in sys.argv:
 	phdrs = {"Prefer": 'return=representation;include="http://www.w3.org/ns/oa#PreferContainedURIs"'}
 	req = requests.get(url=url, headers=phdrs)
 	body = req.json()
-	annos = body['contains']
+	annos = body['first']['items']
 	rnd = random.randrange(0, len(annos))
 	annoUrl = annos[rnd]['id']
 

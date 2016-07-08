@@ -89,7 +89,7 @@ class MangoServer(object):
         self.json_ld_profile = "http://www.w3.org/ns/anno.jsonld"
         self.default_context = "http://www.w3.org/ns/anno.jsonld"
         self.uri_page_size = 500
-        self.description_page_size = 20
+        self.description_page_size = 10
         self.server_prefers = "description"
         self.require_if_match = False # For testing Mirador
 
@@ -386,6 +386,8 @@ class MangoServer(object):
         out = None
         accept = request.headers.get('Accept', '')
         ct = self.json_content_type
+        profile = self.default_profile
+
         if accept:
             prefs = self._parse_accept(accept)
             format = ""
@@ -399,7 +401,7 @@ class MangoServer(object):
                     if "profile" in p[1]:
                         prof = p[1]['profile']
                         if prof in self.known_profiles:
-                            ct += ';profile="{0}"'.format(prof)
+
                             if prof != self.default_profile:
                                 # XXX reframe our content
                                 # See Context Switcher code
@@ -417,6 +419,8 @@ class MangoServer(object):
         h.update(hashed)
 
         response['ETag'] = h.hexdigest()
+        if ct == self.json_content_type:
+            ct += ';profile="{0}"'.format(profile)
         response['content_type'] = ct
         if not out:
             return hashed
@@ -490,38 +494,27 @@ class MangoServer(object):
         return self._conneg(resp, me)
 
     def get_container_projection(self, container, coll, metadata):
-        uri = self._make_uri(container)
-        include = request.query.get('include', self.server_prefers)
 
-        cursor = coll.find({'_id': {'$ne' : self._container_desc_id}}, {'_id':1})
-        totalItems = cursor.count()
-        page_size = getattr(self, "{0}_page_size".format(include))        
-        me = "{0}?include={1}".format(uri, include)
 
-        resp = {"@context": "http://www.w3.org/ns/anno.jsonld",
-                "id": me,            
-                "items" : totalItems} 
-        resp.update(metadata)
 
-        last = totalItems/page_size;
-        resp['first'] = "{0}?include={1}&page=0".format(uri, include)
-        resp['last'] = "{0}?include={1}&page={2}".format(uri, include, last)
         return self._conneg(resp, me)
 
-    def get_container_base(self, container, coll, metadata):
-        uri = self._make_uri(container)        
 
+    def get_container_base(self, container, coll, metadata):
+
+        uri = self._make_uri(container)        
         prefer = request.headers.get('Prefer', '')
-        include = ''
+        include = request.query.get('include', self.server_prefers)
+        minimal = False
+
         if prefer:
             prefs = self._parse_prefer(prefer)
             for p in prefs:
                 if p[0] == ['return', 'representation']:
                     if p[1]['include'] == 'http://www.w3.org/ns/ldp#PreferMinimalContainer':                       
                         # No members
-                        include = 'none'
-                        paged = False
-                    elif p[1]['include'] == 'http://www.w3.org/ns/oa#PreferContainedURIs':
+                        minimal = True
+                    elif p[1]['include'] == 'http://www.w3.org/ns/oa#PreferContainedIRIs':
                         # include only URIs
                         include = 'uri'
                     elif p[1]['include'] == 'http://www.w3.org/ns/oa#PreferContainedDescriptions':
@@ -538,45 +531,44 @@ class MangoServer(object):
             search = base
         cursor = coll.find(search, {'_id':1})
         totalItems = cursor.count()
+        page_size = getattr(self, "{0}_page_size".format(include))        
+        me = "{0}?include={1}".format(uri, include)
 
-        if not include:
-            # Make a sensible default, lacking a client preference
-            include = self.server_prefers
-            max_prefers = getattr(self, "{0}_page_size".format(include))
-            paged = totalItems > max_prefers
-        elif include == 'uri':
-            # Determine whether we need pages
-            paged = totalItems > self.uri_page_size
-        elif include == 'description':
-            paged = totalItems > self.description_page_size
+        resp = {"@context": ["http://www.w3.org/ns/anno.jsonld",
+                "http://www.w3c.org/ns/ldp.jsonld"],
+                "id": me,            
+                "total" : totalItems} 
+        resp.update(metadata)
+        response.headers['Content-Location'] = me
 
-        if not paged:
-            resp = {"@context": ["http://www.w3.org/ns/anno.jsonld",
-                    "http://www.w3c.org/ns/ldp.jsonld"],
-                    "id": uri,            
-                    "total" : totalItems} 
-            resp.update(metadata)
+        if include == 'description':
+            # redo the search to remove just _id filter
+            cursor = coll.find(search)
 
-            if include != 'none':
-                if include == 'description':
-                    cursor = coll.find(search)
-                included = []
-                for what in cursor:
-                    myid = what['_id']
-                    out = self._fix_json(what)
-                    out['id'] = self._make_uri(container, self._unmake_id(myid))           
-                    try:
-                        # XXX This will kill any annotation level extensions
-                        del out['@context']
-                    except:
-                        pass
-                    included.append(out)
-                resp['first'] = {"type": "AnnotationPage", 'items': included}
-            return self._conneg(resp, uri)
+        last = totalItems/page_size;
+        firstUri = "{0}?include={1}&page=0".format(uri, include)
+        lastUri = "{0}?include={1}&page={2}".format(uri, include, last)
+
+        if not minimal:
+            included = []
+            for what in cursor:
+                myid = what['_id']
+                out = self._fix_json(what)
+                out['id'] = self._make_uri(container, self._unmake_id(myid))           
+                try:
+                    # XXX This will kill any annotation level extensions
+                    del out['@context']
+                except:
+                    pass
+                included.append(out)
+            resp['first'] = {"id": firstUri, "type": "AnnotationPage", 'items': included}
         else:
-            # Redirect to new URI, as we're paged
-            newuri = "{0}?include={1}".format(uri, include)
-            redirect(newuri, 303)
+            resp['first'] = firstUri
+            if lastUri != firstUri:
+                resp['last'] = lastUri
+
+        return self._conneg(resp, uri)
+
 
     def _make_search(self, terms):
         # Search for annotations where target is request.query['target']
@@ -602,12 +594,9 @@ class MangoServer(object):
         self.add_link_header('http://www.w3.org/TR/annotation-protocol/', {'rel': 'http://www.w3.org/ns/ldp#constrainedBy'})
 
         if request.query.get('page', ''):
-            # We're a paged
+            # We're a page
             self.add_link_header('http://www.w3.org/ns/oa#AnnotationPage', {'rel':'type'})
             return self.get_container_page(container, coll, metadata)
-        elif request.query.get('include', ''):
-            # We're a projection
-            return self.get_container_projection(container, coll, metadata)
         else:
             # We're the full container
             self.add_link_header('http://www.w3.org/ns/oa#AnnotationCollection', {'rel':'type'})
@@ -658,6 +647,7 @@ class MangoServer(object):
         uri = self._make_uri(container, myid)
         js = self.decorate_annotation(js, uri)
         js["_id"] = myid
+        response.headers['Location'] = uri
         inserted = coll.insert_one(js)
         response.status = 201
         return self._conneg(js, uri)
