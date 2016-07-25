@@ -815,5 +815,17 @@ def main():
 
     run(host=host, port=port, app=mr.get_bottle_app(), debug=debug)
 
+def apache():
+    fh = file('config.json')
+    data = fh.read()
+    fh.close()
+    conf = json.reads(data)
+    ms = MangoServer(**conf)
+    return ms.get_bottle_app()
+
+
 if __name__ == "__main__":
     main()
+else:
+    application = apache()
+

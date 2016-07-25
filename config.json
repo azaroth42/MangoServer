@@ -1,0 +1,11 @@
+{
+	"mongodb_host": "localhost",
+	"mongodb_port": 27017,
+	"database": "mango",
+	"sort_keys": true,
+	"compact_json": false,
+	"indent_json": true,
+	"url_host": "http://iiifdev.getty.edu/",
+	"url_prefix": "annotations",
+	"json_ld": true
+}
