@@ -1,6 +1,6 @@
 {
-	"mongodb_host": "localhost",
-	"mongodb_port": 27017,
+	"host": "localhost",
+	"port": 27017,
 	"database": "mango",
 	"sort_keys": true,
 	"compact_json": false,

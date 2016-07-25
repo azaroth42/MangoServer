@@ -819,10 +819,9 @@ def apache():
     fh = file('config.json')
     data = fh.read()
     fh.close()
-    conf = json.reads(data)
+    conf = json.loads(data)
     ms = MangoServer(**conf)
     return ms.get_bottle_app()
-
 
 if __name__ == "__main__":
     main()
