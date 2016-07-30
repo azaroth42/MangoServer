@@ -188,7 +188,7 @@ class MangoServer(object):
                 exists = coll.find_one({"_id": slug})
                 if not exists:
                     resource = slug                
-        return "anno_" + resource
+        return resource
 
     def _unmake_id(self, value):
         if value.startswith('anno_'):
