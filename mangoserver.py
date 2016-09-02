@@ -637,6 +637,8 @@ class MangoServer(object):
         data = coll.find_one({"_id": self._make_id(container, resource)})
         if not data:
             abort(404)
+
+        self.add_link_header('http://www.w3.org/ns/ldp#Resource', {'rel':'type'})
         uri = self._make_uri(container, resource)
         return self._conneg(data, uri)
 
@@ -729,7 +731,7 @@ class MangoServer(object):
         response.headers['Access-Control-Allow-Methods'] = methods
         response.headers['Access-Control-Allow-Headers'] = 'accept,prefer,content-type'
         response.headers['Allow'] = methods
-        response.headers['Vary'] = "Accept"
+        response.headers['Vary'] = "Accept, Prefer"
 
     def not_implemented(self, *args, **kwargs):
         """Returns not implemented status."""
