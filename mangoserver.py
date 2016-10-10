@@ -727,9 +727,11 @@ class MangoServer(object):
     def after_request(self):
         # Add CORS and other static headers
         methods = 'PUT, PATCH, GET, POST, DELETE, OPTIONS, HEAD'
+        hdrs = 'ETag, Vary, Accept, Prefer, Content-type, Link, Allow, Content-location, Location'
         response.headers['Access-Control-Allow-Origin'] = '*'
         response.headers['Access-Control-Allow-Methods'] = methods
-        response.headers['Access-Control-Allow-Headers'] = 'accept,prefer,content-type'
+        response.headers['Access-Control-Allow-Headers'] = hdrs
+        response.headers['Access-Control-Expose-Headers'] = hdrs
         response.headers['Allow'] = methods
         response.headers['Vary'] = "Accept, Prefer"
 
