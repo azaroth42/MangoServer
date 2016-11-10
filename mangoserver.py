@@ -444,7 +444,6 @@ class MangoServer(object):
     def update_container_modified(self, coll):
         coll.update_one({'_id': self._container_desc_id}, {'$set': {'modified': now()}})
 
-
     def get_container_page(self, container, coll, metadata):
         uri = self._make_uri(container)
 
@@ -452,7 +451,6 @@ class MangoServer(object):
         page = request.query.get('page', '0')
         page = int(page)    
         page_size = getattr(self, "{0}_page_size".format(include))        
-        print "FOUND PAGE SIZE: %s" % page_size
         offset = page * page_size
 
         if include == 'description':
@@ -487,6 +485,7 @@ class MangoServer(object):
         resp = {"@context": "http://www.w3.org/ns/anno.jsonld",
                 "id": me,            
                 "type": "AnnotationPage",
+                "startIndex": offset,
                 "partOf": {
                     "id": curi,
                     "total": totalItems,
@@ -568,7 +567,7 @@ class MangoServer(object):
                 except:
                     pass
                 included.append(out)
-            resp['first'] = {"id": firstUri, "type": "AnnotationPage", 'items': included}
+            resp['first'] = {"id": firstUri, "type": "AnnotationPage", 'startIndex': 0, 'items': included}
         else:
             resp['first'] = firstUri
         if lastUri != firstUri:

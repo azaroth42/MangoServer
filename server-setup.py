@@ -16,9 +16,11 @@ container = {
  "type": ["BasicContainer", "AnnotationCollection"],
  "label": "A Basic Annotation Container",
  "creator": {
+    "id": "https://orcid.org/0000-0003-4441-6852",
+    "type": "Person",
  	"name": "Rob Sanderson",
  	"nickname": "azaroth42",
- 	"email": "azaroth42@gmail.com"
+ 	"email": "mailto:azaroth42@gmail.com"
  },
  "created": now(),
  "rights": "https://creativecommons.org/publicdomain/zero/1.0"
