@@ -4,11 +4,24 @@ import json
 import sys
 import os
 import random
+import time
+
+
+def now():
+	return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
 
 container = {
  "@context": ["http://www.w3.org/ns/anno.jsonld", "http://www.w3c.org/ns/ldp.jsonld"],
  "type": ["BasicContainer", "AnnotationCollection"],
- "label": "A Basic Annotation Container"
+ "label": "A Basic Annotation Container",
+ "creator": {
+ 	"name": "Rob Sanderson",
+ 	"nickname": "azaroth42",
+ 	"email": "azaroth42@gmail.com"
+ },
+ "created": now(),
+ "rights": "https://creativecommons.org/publicdomain/zero/1.0"
 }
 
 anno = {
@@ -19,7 +32,7 @@ anno = {
 }
 
 hdrs = {'Content-Type': 'application/ld+json;profile="http://www.w3.org/ns/anno.jsonld"'}
-url = "http://localhost:8000/annos/"
+url = "http://localhost:8080/annos/"
 
 if '--container' in sys.argv:
 	data = json.dumps(container)

@@ -24,6 +24,9 @@ from pyld.jsonld import compact, expand, frame
 # Stop code from looking up the contexts online EVERY TIME
 docCache = {}
 
+def now():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
 def load_document_local(url):
     if docCache.has_key(url):
         return docCache[url]
@@ -271,12 +274,11 @@ class MangoServer(object):
         return js
 
     def decorate_annotation(self, js, uri=None):
-        now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         if not js.has_key('created'):
             # Add created now() as created time
-            js['created'] = now
+            js['created'] = now()
         else:
-            js['modified'] = now
+            js['modified'] = now()
         # if we have authentication, then add user attributes
         if not js.has_key('id') and uri is not None:
             js['id'] = uri
@@ -439,6 +441,10 @@ class MangoServer(object):
         else:
             response.headers['link'] = l
 
+    def update_container_modified(self, coll):
+        coll.update_one({'_id': self._container_desc_id}, {'$set': {'modified': now()}})
+
+
     def get_container_page(self, container, coll, metadata):
         uri = self._make_uri(container)
 
@@ -446,6 +452,7 @@ class MangoServer(object):
         page = request.query.get('page', '0')
         page = int(page)    
         page_size = getattr(self, "{0}_page_size".format(include))        
+        print "FOUND PAGE SIZE: %s" % page_size
         offset = page * page_size
 
         if include == 'description':
@@ -474,13 +481,16 @@ class MangoServer(object):
         last = "{0}?include={1}&page={2}".format(uri, include, last_page)
         me = "{0}?include={1}&page={2}".format(uri, include, page)
         curi = "{0}?include={1}".format(uri, include)
+        metadata = coll.find_one({"_id": self._container_desc_id})
+        modded = metadata.get('modified', metadata.get('created'))
 
         resp = {"@context": "http://www.w3.org/ns/anno.jsonld",
                 "id": me,            
                 "type": "AnnotationPage",
                 "partOf": {
                     "id": curi,
-                    "total": totalItems
+                    "total": totalItems,
+                    "modified": modded
                 },
                 "items" : included} 
 
@@ -494,11 +504,7 @@ class MangoServer(object):
         return self._conneg(resp, me)
 
     def get_container_projection(self, container, coll, metadata):
-
-
-
         return self._conneg(resp, me)
-
 
     def get_container_base(self, container, coll, metadata):
 
@@ -531,6 +537,7 @@ class MangoServer(object):
             search = base
         cursor = coll.find(search, {'_id':1})
         totalItems = cursor.count()
+
         page_size = getattr(self, "{0}_page_size".format(include))        
         me = "{0}?include={1}".format(uri, include)
 
@@ -551,7 +558,7 @@ class MangoServer(object):
 
         if not minimal:
             included = []
-            for what in cursor:
+            for what in cursor.limit(page_size):
                 myid = what['_id']
                 out = self._fix_json(what)
                 out['id'] = self._make_uri(container, self._unmake_id(myid))           
@@ -564,11 +571,10 @@ class MangoServer(object):
             resp['first'] = {"id": firstUri, "type": "AnnotationPage", 'items': included}
         else:
             resp['first'] = firstUri
-            if lastUri != firstUri:
-                resp['last'] = lastUri
+        if lastUri != firstUri:
+            resp['last'] = lastUri
 
         return self._conneg(resp, uri)
-
 
     def _make_search(self, terms):
         # Search for annotations where target is request.query['target']
@@ -605,6 +611,7 @@ class MangoServer(object):
     def put_container(self, container):
         # Grab the body and put it into magic __container_metadata__
         js = self._fix_json()
+        js['modified'] = now()
         coll = self._collection(container)
         metadata = coll.find_one({"_id": self._container_desc_id})
 
@@ -651,6 +658,7 @@ class MangoServer(object):
         js["_id"] = myid
         response.headers['Location'] = uri
         inserted = coll.insert_one(js)
+        self.update_container_modified(coll)
         response.status = 201
         return self._conneg(js, uri)
 
@@ -684,6 +692,7 @@ class MangoServer(object):
         coll.replace_one({"_id": self._make_id(container, resource)}, js)
         response.status = 202
         uri = self._make_uri(container, resource)
+        self.update_container_modified(coll)
         return self._conneg(js, uri)
 
     def patch_resource(self, container, resource):
@@ -692,6 +701,7 @@ class MangoServer(object):
         coll.update_one({"_id": self._make_id(container, resource)},
                           {"$set": request._json})
         response.status = 202
+        self.update_container_modified(coll)
         return self.get_resource(container, resource)
 
     def delete_resource(self, container, resource):
@@ -699,6 +709,7 @@ class MangoServer(object):
         uri = self._make_uri(container, resource) 
         self.check_if_match(coll, container, resource)
         coll.delete_one({"_id": self._make_id(container, resource)})
+        self.update_container_modified(coll)
         response.status = 204
         return ""
 
