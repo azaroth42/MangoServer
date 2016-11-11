@@ -573,7 +573,7 @@ class MangoServer(object):
         if lastUri != firstUri:
             resp['last'] = lastUri
 
-        return self._conneg(resp, uri)
+        return self._conneg(resp, me)
 
     def _make_search(self, terms):
         # Search for annotations where target is request.query['target']
