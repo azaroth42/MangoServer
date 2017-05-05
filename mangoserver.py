@@ -273,7 +273,7 @@ class MangoServer(object):
             del js['id']
         return js
 
-    def decorate_annotation(self, js, uri=None):
+    def decorate_annotation(self, js, uri):
         if not js.has_key('created'):
             # Add created now() as created time
             js['created'] = now()
@@ -285,6 +285,21 @@ class MangoServer(object):
         if not js.has_key('canonical') and not js.has_key('via'):
             js['canonical'] = js['id']
         js['generator'] = self.server_identity
+        js['generated'] = now()
+
+        # Check if any of the targets are Annotations
+        # and if so, copy properties
+        tgts = js['target']
+        if type(tgts) != list:
+            tgts = [tgts]
+        for tgt in tgts:
+            if type(tgt) != dict:
+                tgt = {'id': tgt}
+            if tgt['id'].startswith(self.url_host):
+                # XXX Fetch target resource
+                # and copy properties
+                pass                
+
         return js
 
     def _mk_rdflib_jsonld(self, js):
@@ -654,7 +669,7 @@ class MangoServer(object):
         myid = self._make_id(container)
         uri = self._make_uri(container, myid)
         js = self.decorate_annotation(js, uri)
-        js["_id"] = myid
+        js["_id"] = uri
         response.headers['Location'] = uri
         inserted = coll.insert_one(js)
         self.update_container_modified(coll)
