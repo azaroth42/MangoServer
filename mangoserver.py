@@ -289,16 +289,16 @@ class MangoServer(object):
 
         # Check if any of the targets are Annotations
         # and if so, copy properties
-        tgts = js['target']
-        if type(tgts) != list:
-            tgts = [tgts]
-        for tgt in tgts:
-            if type(tgt) != dict:
-                tgt = {'id': tgt}
-            if tgt['id'].startswith(self.url_host):
-                # XXX Fetch target resource
-                # and copy properties
-                pass                
+        #tgts = js['target']
+        #if type(tgts) != list:
+        #    tgts = [tgts]
+        #for tgt in tgts:
+            #if type(tgt) != dict:
+            #    tgt = {'id': tgt}
+            #if tgt['id'].startswith(self.url_host):
+            #    # XXX Fetch target resource
+            #    # and copy properties
+            #    pass                
 
         return js
 
@@ -595,6 +595,7 @@ class MangoServer(object):
         # Can be anno.target, anno.target.id, anno.target.source, anno.target.source.id
 
         qterm = request.query['target']
+        print('qterm = %s\n' % qterm)
         if qterm.find("#") > -1:
             qterm = qterm[:qterm.find("#")]
 
@@ -752,7 +753,7 @@ class MangoServer(object):
     def after_request(self):
         # Add CORS and other static headers
         methods = 'PUT, PATCH, GET, POST, DELETE, OPTIONS, HEAD'
-        hdrs = 'ETag, Vary, Accept, Prefer, Content-type, Link, Allow, Content-location, Location'
+        hdrs = 'ETag, Vary, Accept, Prefer, Content-type, Link, Allow, Content-location, Location, Origin'
         response.headers['Access-Control-Allow-Origin'] = '*'
         response.headers['Access-Control-Allow-Methods'] = methods
         response.headers['Access-Control-Allow-Headers'] = hdrs
