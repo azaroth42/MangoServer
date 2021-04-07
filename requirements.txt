@@ -1,4 +1,4 @@
-bottle==0.12.9
+bottle==0.12.19
 html5lib==0.999999999
 isodate==0.5.4
 keepalive==0.5
